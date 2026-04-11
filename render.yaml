@@ -1,0 +1,29 @@
+services:
+  - type: pserv
+    name: TrackEgine
+    runtime: docker
+    region: virginia
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    branch: main
+    autoDeployTrigger: commit
+    numInstances: 1
+
+    envVars:
+      - key: TRACK_ENGINE_SCHEDULE_DB
+        value: /app/data/transit_schedule.db
+      - key: TRACK_ENGINE_THREADS
+        value: "8"
+      - key: TRACK_ENGINE_PREPARE_DB
+        value: "1"
+      - key: TRACK_ENGINE_BOOTSTRAP_DB_URL
+        value: https://track-vkrr.onrender.com/engine/bootstrap/schedule-db.gz
+      - key: TRACK_ENGINE_BOOTSTRAP_TIMEOUT_S
+        value: "1800"
+      - key: TRACK_ENGINE_BOOTSTRAP_RETRIES
+        value: "8"
+
+    disk:
+      name: track-engine-data
+      mountPath: /app/data
+      sizeGB: 10
