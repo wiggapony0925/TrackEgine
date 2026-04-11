@@ -26,8 +26,9 @@ constexpr int kMinTransferSeconds = 120;
 constexpr int kOriginDepartureLimit = 64;
 constexpr int kSecondLegDepartureLimit = 10;
 constexpr int kTransferStopLimit = 10;
-constexpr int kMaxIntermediateStops = 16;
+constexpr int kMaxIntermediateStops = 24;
 constexpr std::size_t kMaxGeneratedItineraries = 96;
+constexpr long long kPruningToleranceS = 900;  // 15 min tolerance for mode diversity
 
 constexpr std::array<const char*, 7> kWeekdayColumns = {
     "monday",
@@ -329,7 +330,13 @@ std::string infer_mode(
         }
         return "lirr";
     }
-    return "subway";
+    // Unknown route_type: classify by route_id heuristics
+    // NYC subway route_ids are single letters or single digits.
+    if (route_id.size() == 1 || route_id == "SI" || route_id == "SIR") {
+        return "subway";
+    }
+    // Default to bus — most unknown routes are bus-like.
+    return "bus";
 }
 
 std::vector<std::string> existing_index_names(sqlite3* db) {
@@ -399,13 +406,18 @@ RouteMeta fetch_route(PlannerContext& ctx, const std::string& route_id) {
             .mode = infer_mode(text_or_empty(stmt.get(), 0), route_type, route_long_name),
         };
     } else {
+        // Route not in database — infer from route_id pattern.
+        std::string inferred_mode = "bus";
+        if (route_id.size() == 1 || route_id == "SI" || route_id == "SIR") {
+            inferred_mode = "subway";
+        }
         meta = RouteMeta{
             .route_id = route_id,
             .route_name = route_id,
             .route_long_name = route_id,
             .color_hex = std::nullopt,
             .route_type = std::nullopt,
-            .mode = "subway",
+            .mode = inferred_mode,
         };
     }
     ctx.route_cache.emplace(route_id, meta);
@@ -488,7 +500,16 @@ std::vector<std::pair<StopRecord, double>> nearby_stops(
         };
         const double distance = haversine_m(lat, lon, record.lat, record.lon);
         if (distance <= static_cast<double>(radius_m)) {
-            results.emplace_back(record, distance);
+            // Skip parent stations that have no stop_times (e.g. GTFS
+            // location_type=1 entries stored without that column)
+            Statement dep_check(
+                ctx.db,
+                "SELECT 1 FROM stop_times WHERE stop_id = ? LIMIT 1"
+            );
+            sqlite3_bind_text(dep_check.get(), 1, record.stop_id.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(dep_check.get()) == SQLITE_ROW) {
+                results.emplace_back(record, distance);
+            }
         }
     }
     std::sort(results.begin(), results.end(), [](const auto& left, const auto& right) {
@@ -879,7 +900,9 @@ std::optional<long long> arrival_cutoff_ts(
     if (results.size() < target_count) {
         return std::nullopt;
     }
-    return results[target_count - 1].arrive_at_ts;
+    // Add tolerance so slower-but-valid routes (e.g. bus+transfer)
+    // aren't pruned before being explored.
+    return results[target_count - 1].arrive_at_ts + kPruningToleranceS;
 }
 
 bool should_prune_arrival(
@@ -1651,7 +1674,7 @@ EngineService::EngineService(std::string schedule_db_path)
     : schedule_db_path_(std::move(schedule_db_path)) {}
 
 const char* EngineService::version() {
-    return "0.4.0";
+    return "0.5.0";
 }
 
 HealthStatus EngineService::health() const {
@@ -1767,6 +1790,9 @@ std::vector<Itinerary> EngineService::compute_itineraries(const PlanRequest& req
 
     std::vector<Itinerary> itineraries;
     std::unordered_set<std::string> seen;
+    // Track which requested modes have produced at least one itinerary.
+    std::unordered_set<std::string> modes_with_results;
+
     for (const auto& departure : departures) {
         const RouteMeta route_meta = fetch_route(ctx, departure.route_id);
         if (!request.modes.contains(route_meta.mode)) {
@@ -1778,15 +1804,26 @@ std::vector<Itinerary> EngineService::compute_itineraries(const PlanRequest& req
             departure.departure_time
         );
         if (should_prune_arrival(request, itineraries, departure_ts)) {
-            break;
+            // If every requested mode already has results, stop.
+            // Otherwise keep exploring underrepresented modes.
+            if (modes_with_results.size() >= request.modes.size()) {
+                break;
+            }
+            if (modes_with_results.contains(route_meta.mode)) {
+                continue;  // this mode already represented, skip
+            }
         }
 
         if (const auto direct = build_direct_itinerary(ctx, request, departure, destination_by_id)) {
             maybe_record_itinerary(request, *direct, itineraries, seen);
+            for (const auto& leg : direct->legs) {
+                if (leg.mode != "walk") modes_with_results.insert(leg.mode);
+            }
         }
         if (request.max_transfers <= 0) {
             continue;
         }
+        const auto pre_transfer_count = itineraries.size();
         build_transfer_itineraries(
             ctx,
             request,
@@ -1796,6 +1833,12 @@ std::vector<Itinerary> EngineService::compute_itineraries(const PlanRequest& req
             itineraries,
             seen
         );
+        // Record modes from any newly added transfer itineraries.
+        for (auto i = pre_transfer_count; i < itineraries.size(); ++i) {
+            for (const auto& leg : itineraries[i].legs) {
+                if (leg.mode != "walk") modes_with_results.insert(leg.mode);
+            }
+        }
     }
 
     if (request.arrive_by_ts) {
@@ -1934,7 +1977,7 @@ PlanRequest plan_request_from_json(const nlohmann::json& payload) {
     request.max_transfers = payload.value("max_transfers", 1);
     request.max_origin_walk_m = payload.value("max_origin_walk_m", 1200);
     request.max_destination_walk_m = payload.value("max_destination_walk_m", 1200);
-    request.max_transfer_walk_m = payload.value("max_transfer_walk_m", 250);
+    request.max_transfer_walk_m = payload.value("max_transfer_walk_m", 400);
     request.search_window_minutes = payload.value("search_window_minutes", 180);
     request.num_itineraries = payload.value("num_itineraries", 3);
     request.modes.clear();
