@@ -522,8 +522,8 @@ std::vector<std::pair<StopRecord, double>> nearby_stops(
 }
 
 // Mode-aware nearby stops: finds stops within a bounding box that serve
-// at least one route of the requested transit mode.  Uses an EXISTS
-// subquery (stops at first match) so it stays fast even on large tables.
+// at least one route of the requested transit mode.  Uses the precomputed
+// stop_modes table for O(1) lookups instead of expensive EXISTS subqueries.
 std::vector<std::pair<StopRecord, double>> nearby_stops_for_mode(
     PlannerContext& ctx,
     double lat,
@@ -538,26 +538,21 @@ std::vector<std::pair<StopRecord, double>> nearby_stops_for_mode(
     std::string route_type_condition;
     if (mode == "bus") {
         route_type_condition =
-            "(r.route_type = 3 OR (r.route_type >= 700 AND r.route_type <= 799))";
+            "(sm.route_type = 3 OR (sm.route_type >= 700 AND sm.route_type <= 799))";
     } else if (mode == "subway") {
-        route_type_condition = "(r.route_type = 1)";
+        route_type_condition = "(sm.route_type = 1)";
     } else {
         // lirr, mnr — both GTFS route_type 2
-        route_type_condition = "(r.route_type = 2)";
+        route_type_condition = "(sm.route_type = 2)";
     }
 
     const std::string sql =
         "SELECT s.stop_id, s.stop_name, s.stop_lat, s.stop_lon "
         "FROM stops s "
+        "JOIN stop_modes sm ON sm.stop_id = s.stop_id "
         "WHERE s.stop_lat BETWEEN ? AND ? "
         "AND s.stop_lon BETWEEN ? AND ? "
-        "AND EXISTS ("
-        "  SELECT 1 FROM stop_times st "
-        "  JOIN trips t ON st.trip_id = t.trip_id "
-        "  JOIN routes r ON t.route_id = r.route_id "
-        "  WHERE st.stop_id = s.stop_id AND " + route_type_condition +
-        "  LIMIT 1"
-        ")";
+        "AND " + route_type_condition;
 
     Statement stmt(ctx.db, sql);
     sqlite3_bind_double(stmt.get(), 1, lat - lat_delta);
@@ -1767,7 +1762,7 @@ EngineService::EngineService(std::string schedule_db_path)
     : schedule_db_path_(std::move(schedule_db_path)) {}
 
 const char* EngineService::version() {
-    return "0.8.1";
+    return "0.8.2";
 }
 
 HealthStatus EngineService::health() const {
@@ -1811,6 +1806,7 @@ std::vector<Itinerary> EngineService::compute_itineraries(const PlanRequest& req
     }
 
     const auto origin_candidates = resolve_candidates(ctx, request.origin, request.max_origin_walk_m, request.modes);
+
     const auto destination_candidates = resolve_candidates(ctx, request.destination, request.max_destination_walk_m, request.modes);
     if (origin_candidates.empty() || destination_candidates.empty()) {
         return {};
@@ -1945,7 +1941,19 @@ std::vector<Itinerary> EngineService::compute_itineraries(const PlanRequest& req
                 missing_modes.insert(m);
             }
         }
+        // Quick check: count departures that belong to missing modes.
+        // If zero, skip the entire supplementary search.
+        bool has_missing_mode_departures = false;
         if (!missing_modes.empty()) {
+            for (const auto& dep : departures) {
+                const RouteMeta rm = fetch_route(ctx, dep.route_id);
+                if (missing_modes.contains(rm.mode)) {
+                    has_missing_mode_departures = true;
+                    break;
+                }
+            }
+        }
+        if (has_missing_mode_departures) {
             // Build a relaxed request with no effective pruning: set a very
             // large search window and no arrival-based cutoff by temporarily
             // collecting into a separate result vector.

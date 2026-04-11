@@ -2,3 +2,4 @@ build/
 tests/__pycache__/
 .pytest_cache/
 *.pyc
+trackengine_local

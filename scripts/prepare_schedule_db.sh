@@ -112,6 +112,21 @@ CREATE INDEX IF NOT EXISTS idx_trips_service ON trips(service_id);
 CREATE INDEX IF NOT EXISTS idx_calendar_date ON calendar_dates(date);
 CREATE INDEX IF NOT EXISTS idx_calendar_service ON calendar(service_id);
 CREATE INDEX IF NOT EXISTS idx_stops_name ON stops(stop_name);
+
+-- Materialized stop-to-mode lookup: eliminates expensive EXISTS subqueries
+-- during nearby_stops_for_mode() by precomputing which route_types each stop serves.
+DROP TABLE IF EXISTS stop_modes;
+CREATE TABLE stop_modes AS
+SELECT DISTINCT st.stop_id, r.route_type
+FROM stop_times st
+JOIN trips t ON st.trip_id = t.trip_id
+JOIN routes r ON t.route_id = r.route_id;
+CREATE INDEX IF NOT EXISTS idx_stop_modes_stop_type ON stop_modes(stop_id, route_type);
+CREATE INDEX IF NOT EXISTS idx_stop_modes_type_stop ON stop_modes(route_type, stop_id);
+
+-- Spatial index on stops for bounding-box queries
+CREATE INDEX IF NOT EXISTS idx_stops_lat_lon ON stops(stop_lat, stop_lon);
+
 ANALYZE;
 SQL
 
