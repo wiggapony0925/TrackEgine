@@ -675,6 +675,29 @@ double distance_to_stop(const LocationInput& location, const StopRecord& stop) {
     return haversine_m(*location.lat, *location.lon, stop.lat, stop.lon);
 }
 
+// ── Parent-station expansion ──────────────────────────────────────
+// When the caller supplies a parent stop_id (e.g. "725") that has no
+// stop_times rows, expand it to its directional children ("725N",
+// "725S") so the planner can find departures.  Also handles
+// alphanumeric prefixes like "R16" → "R16N"/"R16S" and "D24" → etc.
+bool stop_has_departures(PlannerContext& ctx, const std::string& stop_id) {
+    static const std::string kSql = "SELECT 1 FROM stop_times WHERE stop_id = ? LIMIT 1";
+    auto* stmt = ctx.stmts->prepare(kSql);
+    sqlite3_bind_text(stmt, 1, stop_id.c_str(), -1, SQLITE_TRANSIENT);
+    return sqlite3_step(stmt) == SQLITE_ROW;
+}
+
+std::vector<StopRecord> expand_parent_stop(PlannerContext& ctx, const std::string& stop_id) {
+    std::vector<StopRecord> children;
+    for (const char suffix : {'N', 'S'}) {
+        const std::string child_id = stop_id + suffix;
+        if (const auto child = fetch_stop(ctx, child_id)) {
+            children.push_back(*child);
+        }
+    }
+    return children;
+}
+
 std::vector<StopCandidate> resolve_candidates(
     PlannerContext& ctx,
     const LocationInput& location,
@@ -685,16 +708,35 @@ std::vector<StopCandidate> resolve_candidates(
     std::unordered_set<std::string> seen;
     if (location.stop_id) {
         if (const auto stop = fetch_stop(ctx, *location.stop_id)) {
-            const double walk_meters = distance_to_stop(location, *stop);
-            candidates.push_back(StopCandidate{
-                .stop_id = stop->stop_id,
-                .stop_name = stop->stop_name,
-                .lat = stop->lat,
-                .lon = stop->lon,
-                .walk_meters = walk_meters,
-                .walk_seconds = walk_seconds(walk_meters),
-            });
-            seen.insert(stop->stop_id);
+            // If the stop_id is a parent station with no stop_times,
+            // expand to directional children (e.g. "725" → "725N", "725S").
+            if (!stop_has_departures(ctx, stop->stop_id)) {
+                const auto children = expand_parent_stop(ctx, stop->stop_id);
+                for (const auto& child : children) {
+                    if (seen.contains(child.stop_id)) continue;
+                    const double walk_meters = distance_to_stop(location, child);
+                    candidates.push_back(StopCandidate{
+                        .stop_id = child.stop_id,
+                        .stop_name = child.stop_name,
+                        .lat = child.lat,
+                        .lon = child.lon,
+                        .walk_meters = walk_meters,
+                        .walk_seconds = walk_seconds(walk_meters),
+                    });
+                    seen.insert(child.stop_id);
+                }
+            } else {
+                const double walk_meters = distance_to_stop(location, *stop);
+                candidates.push_back(StopCandidate{
+                    .stop_id = stop->stop_id,
+                    .stop_name = stop->stop_name,
+                    .lat = stop->lat,
+                    .lon = stop->lon,
+                    .walk_meters = walk_meters,
+                    .walk_seconds = walk_seconds(walk_meters),
+                });
+                seen.insert(stop->stop_id);
+            }
         }
     }
     if (!location.lat || !location.lon) {
