@@ -60,6 +60,18 @@ if [[ "${PREPARE_DB}" != "1" ]]; then
   exec trackengine "$@"
 fi
 
+# ── Staleness check: re-download if schedule data has expired ──
+if [[ -s "${DB_PATH}" ]]; then
+  TODAY=$(date +%Y%m%d)
+  MAX_END=$(sqlite3 "${DB_PATH}" "SELECT COALESCE(MAX(end_date),'00000000') FROM calendar;" 2>/dev/null || echo "00000000")
+  if [[ "${MAX_END}" < "${TODAY}" ]]; then
+    echo "TrackEngine schedule expired (max_end_date=${MAX_END}, today=${TODAY}), re-downloading" >&2
+    rm -f "${DB_PATH}"
+  else
+    echo "TrackEngine schedule is current (max_end_date=${MAX_END}, today=${TODAY})" >&2
+  fi
+fi
+
 if [[ ! -s "${DB_PATH}" ]]; then
   rm -f "${DB_PATH}"
   bootstrap_schedule_db || echo "TrackEngine DB prep continuing without bootstrap DB" >&2
