@@ -521,6 +521,72 @@ std::vector<std::pair<StopRecord, double>> nearby_stops(
     return results;
 }
 
+// Mode-aware nearby stops: finds stops within a bounding box that serve
+// at least one route of the requested transit mode.  Uses an EXISTS
+// subquery (stops at first match) so it stays fast even on large tables.
+std::vector<std::pair<StopRecord, double>> nearby_stops_for_mode(
+    PlannerContext& ctx,
+    double lat,
+    double lon,
+    int radius_m,
+    const std::string& mode,
+    std::size_t limit
+) {
+    const auto [lat_delta, lon_delta] = bounding_box_degrees(radius_m, lat);
+
+    // Map mode → route_type SQL condition
+    std::string route_type_condition;
+    if (mode == "bus") {
+        route_type_condition =
+            "(r.route_type = 3 OR (r.route_type >= 700 AND r.route_type <= 799))";
+    } else if (mode == "subway") {
+        route_type_condition = "(r.route_type = 1)";
+    } else {
+        // lirr, mnr — both GTFS route_type 2
+        route_type_condition = "(r.route_type = 2)";
+    }
+
+    const std::string sql =
+        "SELECT s.stop_id, s.stop_name, s.stop_lat, s.stop_lon "
+        "FROM stops s "
+        "WHERE s.stop_lat BETWEEN ? AND ? "
+        "AND s.stop_lon BETWEEN ? AND ? "
+        "AND EXISTS ("
+        "  SELECT 1 FROM stop_times st "
+        "  JOIN trips t ON st.trip_id = t.trip_id "
+        "  JOIN routes r ON t.route_id = r.route_id "
+        "  WHERE st.stop_id = s.stop_id AND " + route_type_condition +
+        "  LIMIT 1"
+        ")";
+
+    Statement stmt(ctx.db, sql);
+    sqlite3_bind_double(stmt.get(), 1, lat - lat_delta);
+    sqlite3_bind_double(stmt.get(), 2, lat + lat_delta);
+    sqlite3_bind_double(stmt.get(), 3, lon - lon_delta);
+    sqlite3_bind_double(stmt.get(), 4, lon + lon_delta);
+
+    std::vector<std::pair<StopRecord, double>> results;
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        StopRecord record{
+            .stop_id = text_or_empty(stmt.get(), 0),
+            .stop_name = text_or_empty(stmt.get(), 1),
+            .lat = sqlite3_column_double(stmt.get(), 2),
+            .lon = sqlite3_column_double(stmt.get(), 3),
+        };
+        const double distance = haversine_m(lat, lon, record.lat, record.lon);
+        if (distance <= static_cast<double>(radius_m)) {
+            results.emplace_back(record, distance);
+        }
+    }
+    std::sort(results.begin(), results.end(), [](const auto& left, const auto& right) {
+        return std::tie(left.second, left.first.stop_name) < std::tie(right.second, right.first.stop_name);
+    });
+    if (results.size() > limit) {
+        results.resize(limit);
+    }
+    return results;
+}
+
 double distance_to_stop(const LocationInput& location, const StopRecord& stop) {
     if (!location.lat || !location.lon) {
         return 0.0;
@@ -531,7 +597,8 @@ double distance_to_stop(const LocationInput& location, const StopRecord& stop) {
 std::vector<StopCandidate> resolve_candidates(
     PlannerContext& ctx,
     const LocationInput& location,
-    int max_walk_m
+    int max_walk_m,
+    const std::unordered_set<std::string>& modes
 ) {
     std::vector<StopCandidate> candidates;
     std::unordered_set<std::string> seen;
@@ -577,11 +644,37 @@ std::vector<StopCandidate> resolve_candidates(
             .walk_seconds = walk_seconds(distance),
         });
     }
+
+    // ── Mode-balanced augmentation ──
+    // In dense subway areas, the 10 closest stops may all be subway.
+    // For each requested mode, ensure at least a few stops are present
+    // by running a mode-specific spatial query (EXISTS subquery, fast).
+    constexpr std::size_t kPerModeMin = 4;
+    for (const auto& mode : modes) {
+        auto mode_nearby = nearby_stops_for_mode(
+            ctx, *location.lat, *location.lon, max_walk_m, mode, kPerModeMin
+        );
+        for (const auto& [stop, distance] : mode_nearby) {
+            if (seen.contains(stop.stop_id)) {
+                continue;
+            }
+            seen.insert(stop.stop_id);
+            candidates.push_back(StopCandidate{
+                .stop_id = stop.stop_id,
+                .stop_name = stop.stop_name,
+                .lat = stop.lat,
+                .lon = stop.lon,
+                .walk_meters = distance,
+                .walk_seconds = walk_seconds(distance),
+            });
+        }
+    }
+
     std::sort(candidates.begin(), candidates.end(), [](const auto& left, const auto& right) {
         return std::tie(left.walk_seconds, left.stop_name) < std::tie(right.walk_seconds, right.stop_name);
     });
-    if (candidates.size() > 12) {
-        candidates.resize(12);
+    if (candidates.size() > 20) {
+        candidates.resize(20);
     }
     return candidates;
 }
@@ -1717,8 +1810,8 @@ std::vector<Itinerary> EngineService::compute_itineraries(const PlanRequest& req
         return {};
     }
 
-    const auto origin_candidates = resolve_candidates(ctx, request.origin, request.max_origin_walk_m);
-    const auto destination_candidates = resolve_candidates(ctx, request.destination, request.max_destination_walk_m);
+    const auto origin_candidates = resolve_candidates(ctx, request.origin, request.max_origin_walk_m, request.modes);
+    const auto destination_candidates = resolve_candidates(ctx, request.destination, request.max_destination_walk_m, request.modes);
     if (origin_candidates.empty() || destination_candidates.empty()) {
         return {};
     }
