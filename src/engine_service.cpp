@@ -1767,7 +1767,7 @@ EngineService::EngineService(std::string schedule_db_path)
     : schedule_db_path_(std::move(schedule_db_path)) {}
 
 const char* EngineService::version() {
-    return "0.7.0";
+    return "0.8.0";
 }
 
 HealthStatus EngineService::health() const {
