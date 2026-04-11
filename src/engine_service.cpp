@@ -1674,7 +1674,7 @@ EngineService::EngineService(std::string schedule_db_path)
     : schedule_db_path_(std::move(schedule_db_path)) {}
 
 const char* EngineService::version() {
-    return "0.5.0";
+    return "0.6.0";
 }
 
 HealthStatus EngineService::health() const {
@@ -1837,6 +1837,72 @@ std::vector<Itinerary> EngineService::compute_itineraries(const PlanRequest& req
         for (auto i = pre_transfer_count; i < itineraries.size(); ++i) {
             for (const auto& leg : itineraries[i].legs) {
                 if (leg.mode != "walk") modes_with_results.insert(leg.mode);
+            }
+        }
+    }
+
+    // ── Second pass: supplementary search for underrepresented modes ──
+    // If a requested mode (e.g. "bus") has zero itineraries after the main
+    // loop, re-scan bus departures with NO pruning cutoff so that slower
+    // bus→subway transfer itineraries are discovered.
+    {
+        std::unordered_set<std::string> missing_modes;
+        for (const auto& m : request.modes) {
+            if (!modes_with_results.contains(m)) {
+                missing_modes.insert(m);
+            }
+        }
+        if (!missing_modes.empty()) {
+            // Build a relaxed request with no effective pruning: set a very
+            // large search window and no arrival-based cutoff by temporarily
+            // collecting into a separate result vector.
+            std::vector<Itinerary> supplementary;
+            std::unordered_set<std::string> sup_seen = seen;  // keep existing dedup
+
+            for (const auto& departure : departures) {
+                if (supplementary.size() >= 4) break;  // cap supplementary results
+                const RouteMeta route_meta = fetch_route(ctx, departure.route_id);
+                if (!missing_modes.contains(route_meta.mode)) {
+                    continue;  // only explore missing modes
+                }
+                // Try direct itinerary (unlikely for bus→Manhattan but cheap)
+                if (const auto direct = build_direct_itinerary(ctx, request, departure, destination_by_id)) {
+                    const std::string key = itinerary_key(*direct);
+                    if (!sup_seen.contains(key)) {
+                        sup_seen.insert(key);
+                        supplementary.push_back(*direct);
+                    }
+                }
+                if (request.max_transfers <= 0) continue;
+
+                // For transfer exploration, temporarily inflate results to
+                // disable should_prune_arrival checks inside build_transfer_itineraries.
+                // We do this by passing an empty results vector.
+                std::vector<Itinerary> transfer_results;
+                std::unordered_set<std::string> transfer_seen = sup_seen;
+                build_transfer_itineraries(
+                    ctx,
+                    request,
+                    departure,
+                    destination_by_id,
+                    active_services,
+                    transfer_results,
+                    transfer_seen
+                );
+                for (auto& it : transfer_results) {
+                    const std::string key = itinerary_key(it);
+                    if (!sup_seen.contains(key)) {
+                        sup_seen.insert(key);
+                        supplementary.push_back(std::move(it));
+                        if (supplementary.size() >= 4) break;
+                    }
+                }
+            }
+            // Sort supplementary by arrival time, keep best 2 per missing mode
+            std::sort(supplementary.begin(), supplementary.end(), departure_result_less);
+            for (const auto& it : supplementary) {
+                if (itineraries.size() >= static_cast<std::size_t>(request.num_itineraries) + 2) break;
+                itineraries.push_back(it);
             }
         }
     }
