@@ -1,6 +1,6 @@
 services:
   - type: pserv
-    name: TrackEgine
+    name: TrackEngine
     runtime: docker
     region: virginia
     plan: starter

@@ -21,7 +21,7 @@ namespace trackengine {
 namespace {
 
 constexpr double kEarthRadiusM = 6'371'009.0;
-constexpr double kWalkSpeedMps = 1.35;
+constexpr double kWalkSpeedMps = 1.45;  // NYC walkers average ~3.2 mph
 constexpr int kMinTransferSeconds = 120;
 constexpr int kOriginDepartureLimit = 64;
 constexpr int kSecondLegDepartureLimit = 10;
@@ -51,10 +51,13 @@ struct SqliteConnection {
     sqlite3* db = nullptr;
 
     explicit SqliteConnection(const std::string& db_path) {
+        // Use READWRITE instead of READONLY so that SQLite can create the
+        // shared-memory mapping required by WAL-mode databases.  The engine
+        // never writes data — it only reads the schedule.
         const int rc = sqlite3_open_v2(
             db_path.c_str(),
             &db,
-            SQLITE_OPEN_READONLY,
+            SQLITE_OPEN_READWRITE,
             nullptr
         );
         if (rc != SQLITE_OK || db == nullptr) {
@@ -103,8 +106,51 @@ private:
     sqlite3_stmt* stmt_ = nullptr;
 };
 
+// ── Prepared statement cache ──────────────────────────────────────
+// Compiles each SQL string once per PlannerContext (i.e. per request).
+// Subsequent calls with the same SQL reuse the compiled statement via
+// sqlite3_reset() + sqlite3_clear_bindings(), avoiding the cost of
+// sqlite3_prepare_v2 on every invocation.
+class StatementCache final {
+public:
+    explicit StatementCache(sqlite3* db) : db_(db) {}
+
+    ~StatementCache() {
+        for (auto& [sql, stmt] : cache_) {
+            if (stmt != nullptr) {
+                sqlite3_finalize(stmt);
+            }
+        }
+    }
+
+    StatementCache(const StatementCache&) = delete;
+    StatementCache& operator=(const StatementCache&) = delete;
+
+    // Returns a ready-to-bind statement.  Caller must NOT finalize it.
+    sqlite3_stmt* prepare(const std::string& sql) {
+        auto it = cache_.find(sql);
+        if (it != cache_.end()) {
+            sqlite3_reset(it->second);
+            sqlite3_clear_bindings(it->second);
+            return it->second;
+        }
+        sqlite3_stmt* stmt = nullptr;
+        const int rc = sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr);
+        if (rc != SQLITE_OK || stmt == nullptr) {
+            throw std::runtime_error(sqlite3_errmsg(db_));
+        }
+        cache_.emplace(sql, stmt);
+        return stmt;
+    }
+
+private:
+    sqlite3* db_;
+    std::unordered_map<std::string, sqlite3_stmt*> cache_;
+};
+
 struct PlannerContext {
     sqlite3* db = nullptr;
+    std::unique_ptr<StatementCache> stmts;  // compiled-statement cache
     std::unordered_map<std::string, std::optional<StopRecord>> stop_cache;
     std::unordered_map<std::string, RouteMeta> route_cache;
     std::unordered_map<std::string, std::vector<StopTimeRow>> downstream_cache;
@@ -174,6 +220,11 @@ std::string seconds_to_gtfs_time(long long total_seconds) {
 }
 
 long long gtfs_time_to_timestamp(long long midnight_ts, const std::string& gtfs_time) {
+    // GTFS times can exceed 24:00:00 (e.g. 25:15:00 for a post-midnight
+    // trip started before midnight).  The arithmetic is correct because
+    // gtfs_time_to_seconds returns total seconds from service-day midnight,
+    // and service_day_midnight_ts is already calibrated to the correct
+    // calendar date.  No additional day-rollover adjustment is needed.
     return midnight_ts + static_cast<long long>(gtfs_time_to_seconds(gtfs_time));
 }
 
@@ -267,6 +318,17 @@ bool looks_like_subway_stop_id(const std::string& stop_id) {
            });
 }
 
+// ── Parent-station helper ─────────────────────────────────────────
+// MTA GTFS uses directional platform IDs like "101N" / "101S".
+// This strips the trailing direction letter to get the station ID,
+// so both platforms map to "101" for grouping purposes.
+std::string parent_stop_id(const std::string& stop_id) {
+    if (looks_like_subway_stop_id(stop_id)) {
+        return stop_id.substr(0, stop_id.size() - 1);
+    }
+    return stop_id;
+}
+
 std::optional<std::string> subway_color_for_route(const std::string& route_id) {
     static const std::unordered_map<std::string, std::string> kSubwayColors = {
         {"1", "#EE352E"},
@@ -358,21 +420,20 @@ std::optional<StopRecord> fetch_stop(PlannerContext& ctx, const std::string& sto
     if (cached != ctx.stop_cache.end()) {
         return cached->second;
     }
-    Statement stmt(
-        ctx.db,
+    static const std::string kSql =
         "SELECT stop_id, stop_name, stop_lat, stop_lon "
-        "FROM stops WHERE stop_id = ?"
-    );
-    sqlite3_bind_text(stmt.get(), 1, stop_id.c_str(), -1, SQLITE_TRANSIENT);
-    if (sqlite3_step(stmt.get()) != SQLITE_ROW) {
+        "FROM stops WHERE stop_id = ?";
+    auto* stmt = ctx.stmts->prepare(kSql);
+    sqlite3_bind_text(stmt, 1, stop_id.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt) != SQLITE_ROW) {
         ctx.stop_cache.emplace(stop_id, std::nullopt);
         return std::nullopt;
     }
     StopRecord stop{
-        .stop_id = text_or_empty(stmt.get(), 0),
-        .stop_name = text_or_empty(stmt.get(), 1),
-        .lat = sqlite3_column_double(stmt.get(), 2),
-        .lon = sqlite3_column_double(stmt.get(), 3),
+        .stop_id = text_or_empty(stmt, 0),
+        .stop_name = text_or_empty(stmt, 1),
+        .lat = sqlite3_column_double(stmt, 2),
+        .lon = sqlite3_column_double(stmt, 3),
     };
     ctx.stop_cache.emplace(stop_id, stop);
     return stop;
@@ -383,27 +444,26 @@ RouteMeta fetch_route(PlannerContext& ctx, const std::string& route_id) {
     if (cached != ctx.route_cache.end()) {
         return cached->second;
     }
-    Statement stmt(
-        ctx.db,
+    static const std::string kSql =
         "SELECT route_id, route_short_name, route_long_name, route_color, route_type "
-        "FROM routes WHERE route_id = ?"
-    );
-    sqlite3_bind_text(stmt.get(), 1, route_id.c_str(), -1, SQLITE_TRANSIENT);
+        "FROM routes WHERE route_id = ?";
+    auto* stmt = ctx.stmts->prepare(kSql);
+    sqlite3_bind_text(stmt, 1, route_id.c_str(), -1, SQLITE_TRANSIENT);
     RouteMeta meta;
-    if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
-        const auto route_short_name = optional_string(stmt.get(), 1);
-        const auto route_long_name = optional_string(stmt.get(), 2);
-        const auto route_color = optional_string(stmt.get(), 3);
-        const auto route_type = sqlite3_column_type(stmt.get(), 4) == SQLITE_NULL
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const auto route_short_name = optional_string(stmt, 1);
+        const auto route_long_name = optional_string(stmt, 2);
+        const auto route_color = optional_string(stmt, 3);
+        const auto route_type = sqlite3_column_type(stmt, 4) == SQLITE_NULL
                                     ? std::optional<int>()
-                                    : std::optional<int>(sqlite3_column_int(stmt.get(), 4));
+                                    : std::optional<int>(sqlite3_column_int(stmt, 4));
         meta = RouteMeta{
-            .route_id = text_or_empty(stmt.get(), 0),
-            .route_name = route_display_name(text_or_empty(stmt.get(), 0), route_short_name, route_long_name),
-            .route_long_name = route_long_name.value_or(text_or_empty(stmt.get(), 0)),
+            .route_id = text_or_empty(stmt, 0),
+            .route_name = route_display_name(text_or_empty(stmt, 0), route_short_name, route_long_name),
+            .route_long_name = route_long_name.value_or(text_or_empty(stmt, 0)),
             .color_hex = normalize_color(route_color),
             .route_type = route_type,
-            .mode = infer_mode(text_or_empty(stmt.get(), 0), route_type, route_long_name),
+            .mode = infer_mode(text_or_empty(stmt, 0), route_type, route_long_name),
         };
     } else {
         // Route not in database — infer from route_id pattern.
@@ -478,36 +538,35 @@ std::vector<std::pair<StopRecord, double>> nearby_stops(
     std::size_t limit
 ) {
     const auto [lat_delta, lon_delta] = bounding_box_degrees(radius_m, lat);
-    Statement stmt(
-        ctx.db,
+    static const std::string kSql =
         "SELECT stop_id, stop_name, stop_lat, stop_lon "
         "FROM stops "
         "WHERE stop_lat BETWEEN ? AND ? "
-        "AND stop_lon BETWEEN ? AND ?"
-    );
-    sqlite3_bind_double(stmt.get(), 1, lat - lat_delta);
-    sqlite3_bind_double(stmt.get(), 2, lat + lat_delta);
-    sqlite3_bind_double(stmt.get(), 3, lon - lon_delta);
-    sqlite3_bind_double(stmt.get(), 4, lon + lon_delta);
+        "AND stop_lon BETWEEN ? AND ?";
+    auto* stmt = ctx.stmts->prepare(kSql);
+    sqlite3_bind_double(stmt, 1, lat - lat_delta);
+    sqlite3_bind_double(stmt, 2, lat + lat_delta);
+    sqlite3_bind_double(stmt, 3, lon - lon_delta);
+    sqlite3_bind_double(stmt, 4, lon + lon_delta);
+
+    static const std::string kDepCheckSql =
+        "SELECT 1 FROM stop_times WHERE stop_id = ? LIMIT 1";
 
     std::vector<std::pair<StopRecord, double>> results;
-    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
         StopRecord record{
-            .stop_id = text_or_empty(stmt.get(), 0),
-            .stop_name = text_or_empty(stmt.get(), 1),
-            .lat = sqlite3_column_double(stmt.get(), 2),
-            .lon = sqlite3_column_double(stmt.get(), 3),
+            .stop_id = text_or_empty(stmt, 0),
+            .stop_name = text_or_empty(stmt, 1),
+            .lat = sqlite3_column_double(stmt, 2),
+            .lon = sqlite3_column_double(stmt, 3),
         };
         const double distance = haversine_m(lat, lon, record.lat, record.lon);
         if (distance <= static_cast<double>(radius_m)) {
             // Skip parent stations that have no stop_times (e.g. GTFS
             // location_type=1 entries stored without that column)
-            Statement dep_check(
-                ctx.db,
-                "SELECT 1 FROM stop_times WHERE stop_id = ? LIMIT 1"
-            );
-            sqlite3_bind_text(dep_check.get(), 1, record.stop_id.c_str(), -1, SQLITE_TRANSIENT);
-            if (sqlite3_step(dep_check.get()) == SQLITE_ROW) {
+            auto* dep_check = ctx.stmts->prepare(kDepCheckSql);
+            sqlite3_bind_text(dep_check, 1, record.stop_id.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(dep_check) == SQLITE_ROW) {
                 results.emplace_back(record, distance);
             }
         }
@@ -515,15 +574,30 @@ std::vector<std::pair<StopRecord, double>> nearby_stops(
     std::sort(results.begin(), results.end(), [](const auto& left, const auto& right) {
         return std::tie(left.second, left.first.stop_name) < std::tie(right.second, right.first.stop_name);
     });
-    if (results.size() > limit) {
-        results.resize(limit);
+
+    // Group by parent station so directional platforms (101N/101S)
+    // don't consume multiple limit slots for the same physical station.
+    std::unordered_map<std::string, std::size_t> station_slots;
+    std::vector<std::pair<StopRecord, double>> deduped;
+    for (const auto& entry : results) {
+        const std::string parent = parent_stop_id(entry.first.stop_id);
+        auto& count = station_slots[parent];
+        if (count < 2) {  // keep at most 2 platforms per station (N+S)
+            deduped.push_back(entry);
+            ++count;
+        }
     }
-    return results;
+    if (deduped.size() > limit) {
+        deduped.resize(limit);
+    }
+    return deduped;
 }
 
 // Mode-aware nearby stops: finds stops within a bounding box that serve
 // at least one route of the requested transit mode.  Uses the precomputed
 // stop_modes table for O(1) lookups instead of expensive EXISTS subqueries.
+// Falls back silently to an empty result when stop_modes does not exist
+// (e.g. during tests or before prepare_schedule_db.sh runs).
 std::vector<std::pair<StopRecord, double>> nearby_stops_for_mode(
     PlannerContext& ctx,
     double lat,
@@ -554,19 +628,31 @@ std::vector<std::pair<StopRecord, double>> nearby_stops_for_mode(
         "AND s.stop_lon BETWEEN ? AND ? "
         "AND " + route_type_condition;
 
-    Statement stmt(ctx.db, sql);
-    sqlite3_bind_double(stmt.get(), 1, lat - lat_delta);
-    sqlite3_bind_double(stmt.get(), 2, lat + lat_delta);
-    sqlite3_bind_double(stmt.get(), 3, lon - lon_delta);
-    sqlite3_bind_double(stmt.get(), 4, lon + lon_delta);
+    // The stop_modes table is created by prepare_schedule_db.sh.
+    // If it doesn't exist yet, gracefully return an empty set.
+    sqlite3_stmt* raw_stmt = nullptr;
+    const int rc = sqlite3_prepare_v2(ctx.db, sql.c_str(), -1, &raw_stmt, nullptr);
+    if (rc != SQLITE_OK || raw_stmt == nullptr) {
+        if (raw_stmt != nullptr) {
+            sqlite3_finalize(raw_stmt);
+        }
+        return {};  // stop_modes table missing — not an error
+    }
+    sqlite3_finalize(raw_stmt);  // we just validated; use cache below
+
+    auto* stmt = ctx.stmts->prepare(sql);
+    sqlite3_bind_double(stmt, 1, lat - lat_delta);
+    sqlite3_bind_double(stmt, 2, lat + lat_delta);
+    sqlite3_bind_double(stmt, 3, lon - lon_delta);
+    sqlite3_bind_double(stmt, 4, lon + lon_delta);
 
     std::vector<std::pair<StopRecord, double>> results;
-    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
         StopRecord record{
-            .stop_id = text_or_empty(stmt.get(), 0),
-            .stop_name = text_or_empty(stmt.get(), 1),
-            .lat = sqlite3_column_double(stmt.get(), 2),
-            .lon = sqlite3_column_double(stmt.get(), 3),
+            .stop_id = text_or_empty(stmt, 0),
+            .stop_name = text_or_empty(stmt, 1),
+            .lat = sqlite3_column_double(stmt, 2),
+            .lon = sqlite3_column_double(stmt, 3),
         };
         const double distance = haversine_m(lat, lon, record.lat, record.lon);
         if (distance <= static_cast<double>(radius_m)) {
@@ -697,27 +783,27 @@ std::vector<DepartureRow> find_departures(
         "ORDER BY st.departure_time ASC, st.stop_sequence ASC "
         "LIMIT ?";
 
-    Statement stmt(ctx.db, sql);
+    auto* stmt = ctx.stmts->prepare(sql);
     int bind_index = 1;
     for (const auto& stop_id : stop_ids) {
-        sqlite3_bind_text(stmt.get(), bind_index++, stop_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, bind_index++, stop_id.c_str(), -1, SQLITE_TRANSIENT);
     }
     for (const auto& service_id : service_ids) {
-        sqlite3_bind_text(stmt.get(), bind_index++, service_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, bind_index++, service_id.c_str(), -1, SQLITE_TRANSIENT);
     }
-    sqlite3_bind_text(stmt.get(), bind_index++, depart_from.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt.get(), bind_index++, depart_to.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmt.get(), bind_index, limit);
+    sqlite3_bind_text(stmt, bind_index++, depart_from.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, bind_index++, depart_to.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, bind_index, limit);
 
     std::vector<DepartureRow> rows;
-    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
         rows.push_back(DepartureRow{
-            .stop_id = text_or_empty(stmt.get(), 0),
-            .departure_time = text_or_empty(stmt.get(), 1),
-            .stop_sequence = sqlite3_column_int(stmt.get(), 2),
-            .trip_id = text_or_empty(stmt.get(), 3),
-            .route_id = text_or_empty(stmt.get(), 4),
-            .trip_headsign = optional_string(stmt.get(), 5),
+            .stop_id = text_or_empty(stmt, 0),
+            .departure_time = text_or_empty(stmt, 1),
+            .stop_sequence = sqlite3_column_int(stmt, 2),
+            .trip_id = text_or_empty(stmt, 3),
+            .route_id = text_or_empty(stmt, 4),
+            .trip_headsign = optional_string(stmt, 5),
         });
     }
     return rows;
@@ -732,21 +818,20 @@ const std::vector<StopTimeRow>& downstream_stop_times(
     if (const auto cached = ctx.downstream_cache.find(cache_key); cached != ctx.downstream_cache.end()) {
         return cached->second;
     }
-    Statement stmt(
-        ctx.db,
+    static const std::string kSql =
         "SELECT stop_id, arrival_time, departure_time, stop_sequence "
         "FROM stop_times WHERE trip_id = ? AND stop_sequence > ? "
-        "ORDER BY stop_sequence ASC"
-    );
-    sqlite3_bind_text(stmt.get(), 1, trip_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmt.get(), 2, after_sequence);
+        "ORDER BY stop_sequence ASC";
+    auto* stmt = ctx.stmts->prepare(kSql);
+    sqlite3_bind_text(stmt, 1, trip_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 2, after_sequence);
     auto& rows = ctx.downstream_cache[cache_key];
-    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
         rows.push_back(StopTimeRow{
-            .stop_id = text_or_empty(stmt.get(), 0),
-            .arrival_time = text_or_empty(stmt.get(), 1),
-            .departure_time = text_or_empty(stmt.get(), 2),
-            .stop_sequence = sqlite3_column_int(stmt.get(), 3),
+            .stop_id = text_or_empty(stmt, 0),
+            .arrival_time = text_or_empty(stmt, 1),
+            .departure_time = text_or_empty(stmt, 2),
+            .stop_sequence = sqlite3_column_int(stmt, 3),
         });
     }
     return rows;
@@ -1762,7 +1847,7 @@ EngineService::EngineService(std::string schedule_db_path)
     : schedule_db_path_(std::move(schedule_db_path)) {}
 
 const char* EngineService::version() {
-    return "0.8.2";
+    return "0.9.0";
 }
 
 HealthStatus EngineService::health() const {
@@ -1798,7 +1883,10 @@ HealthStatus EngineService::health() const {
 
 std::vector<Itinerary> EngineService::compute_itineraries(const PlanRequest& request) const {
     SqliteConnection connection(schedule_db_path_);
-    PlannerContext ctx{.db = connection.db};
+    PlannerContext ctx{
+        .db = connection.db,
+        .stmts = std::make_unique<StatementCache>(connection.db),
+    };
 
     const auto active_services = active_service_ids(ctx, request.service_day_yyyymmdd, request.service_weekday);
     if (active_services.empty()) {

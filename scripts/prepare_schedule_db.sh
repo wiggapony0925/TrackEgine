@@ -60,6 +60,17 @@ if [[ "${PREPARE_DB}" != "1" ]]; then
   exec trackengine "$@"
 fi
 
+# ── Start trackengine immediately so the port binds and Render's ──
+# ── port scanner succeeds.  Health will return 503 (ready:false)  ──
+# ── until the DB is prepared.                                     ──
+trackengine "$@" &
+ENGINE_PID=$!
+
+# Forward termination signals to the engine process
+cleanup() { kill -TERM "$ENGINE_PID" 2>/dev/null; wait "$ENGINE_PID" 2>/dev/null; }
+trap 'cleanup; exit 143' TERM
+trap 'cleanup; exit 130' INT
+
 # ── Staleness check: re-download if schedule data has expired ──
 if [[ -s "${DB_PATH}" ]]; then
   TODAY=$(date +%Y%m%d)
@@ -90,12 +101,14 @@ fi
 
 if [[ ! -f "${DB_PATH}" ]]; then
   echo "TrackEngine DB prep skipped: ${DB_PATH} does not exist" >&2
-  exec trackengine "$@"
+  wait "$ENGINE_PID"
+  exit $?
 fi
 
 if [[ ! -w "${DB_PATH}" ]]; then
   echo "TrackEngine DB prep skipped: ${DB_PATH} is not writable" >&2
-  exec trackengine "$@"
+  wait "$ENGINE_PID"
+  exit $?
 fi
 
 echo "Preparing TrackEngine schedule DB indexes for ${DB_PATH}" >&2
@@ -130,4 +143,7 @@ CREATE INDEX IF NOT EXISTS idx_stops_lat_lon ON stops(stop_lat, stop_lon);
 ANALYZE;
 SQL
 
-exec trackengine "$@"
+echo "TrackEngine DB prep complete, engine is already serving" >&2
+
+# Wait for the engine (it was started at the top)
+wait "$ENGINE_PID"
