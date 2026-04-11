@@ -72,6 +72,17 @@ if [[ -s "${DB_PATH}" ]]; then
   fi
 fi
 
+# ── Completeness check: re-download if bus data is missing ──
+if [[ -s "${DB_PATH}" ]]; then
+  BUS_COUNT=$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM routes WHERE route_type = 3 OR (route_type >= 700 AND route_type <= 799);" 2>/dev/null || echo "0")
+  if [[ "${BUS_COUNT}" -eq 0 ]]; then
+    echo "TrackEngine schedule has no bus routes — re-downloading" >&2
+    rm -f "${DB_PATH}"
+  else
+    echo "TrackEngine schedule has ${BUS_COUNT} bus routes" >&2
+  fi
+fi
+
 if [[ ! -s "${DB_PATH}" ]]; then
   rm -f "${DB_PATH}"
   bootstrap_schedule_db || echo "TrackEngine DB prep continuing without bootstrap DB" >&2
