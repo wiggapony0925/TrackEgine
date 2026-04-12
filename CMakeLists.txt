@@ -16,6 +16,7 @@ find_package(SQLite3 REQUIRED)
 add_executable(trackengine
     src/main.cpp
     src/engine_service.cpp
+    src/logger.cpp
 )
 
 target_include_directories(trackengine

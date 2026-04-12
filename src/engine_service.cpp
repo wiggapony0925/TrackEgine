@@ -1,4 +1,5 @@
 #include "trackengine/engine_service.hpp"
+#include "trackengine/logger.hpp"
 
 #include <algorithm>
 #include <array>
@@ -2117,12 +2118,16 @@ HealthStatus EngineService::health() const {
         }
     } catch (const std::exception& error) {
         std::cerr << "TrackEngine health error: " << error.what() << "\n";
+        log::error("HEALTH", "Health check failed", {{"detail", error.what()}});
         health.ready = false;
     }
     return health;
 }
 
 std::vector<Itinerary> EngineService::compute_itineraries(const PlanRequest& request) const {
+    log::Timer total_timer;
+    log::Timer phase_timer;
+
     SqliteConnection connection(schedule_db_path_);
     PlannerContext ctx{
         .db = connection.db,
@@ -2131,14 +2136,28 @@ std::vector<Itinerary> EngineService::compute_itineraries(const PlanRequest& req
 
     const auto active_services = active_service_ids(ctx, request.service_day_yyyymmdd, request.service_weekday);
     if (active_services.empty()) {
+        log::warn("PLAN", "No active services", {
+            {"service_day", request.service_day_yyyymmdd},
+            {"weekday", request.service_weekday},
+        });
         return {};
     }
+    const double services_ms = phase_timer.elapsed_ms();
+    phase_timer.reset();
 
     const auto origin_candidates = resolve_candidates(ctx, request.origin, request.max_origin_walk_m, request.modes);
     const auto destination_candidates = resolve_candidates(ctx, request.destination, request.max_destination_walk_m, request.modes);
     if (origin_candidates.empty() || destination_candidates.empty()) {
+        log::warn("PLAN", "No stop candidates", {
+            {"origin_stops", origin_candidates.size()},
+            {"dest_stops", destination_candidates.size()},
+            {"origin", request.origin.label},
+            {"destination", request.destination.label},
+        });
         return {};
     }
+    const double candidates_ms = phase_timer.elapsed_ms();
+    phase_timer.reset();
 
     std::unordered_map<std::string, StopCandidate> destination_by_id;
     destination_by_id.reserve(destination_candidates.size());
@@ -2397,6 +2416,20 @@ std::vector<Itinerary> EngineService::compute_itineraries(const PlanRequest& req
     if (itineraries.size() > static_cast<std::size_t>(request.num_itineraries)) {
         itineraries.resize(static_cast<std::size_t>(request.num_itineraries));
     }
+
+    log::info("PLAN", "compute_itineraries done", {
+        {"total_ms", std::round(total_timer.elapsed_ms() * 10.0) / 10.0},
+        {"services_ms", std::round(services_ms * 10.0) / 10.0},
+        {"candidates_ms", std::round(candidates_ms * 10.0) / 10.0},
+        {"origin", request.origin.label},
+        {"destination", request.destination.label},
+        {"origin_stops", origin_candidates.size()},
+        {"dest_stops", destination_candidates.size()},
+        {"departures", departures.size()},
+        {"itineraries", itineraries.size()},
+        {"max_transfers", request.max_transfers},
+    });
+
     return itineraries;
 }
 
