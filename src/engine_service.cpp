@@ -163,6 +163,18 @@ struct PlannerContext {
     bool budget_exceeded() const {
         return std::chrono::steady_clock::now() >= deadline;
     }
+
+    // Iteration-gated budget check: only queries the clock every N
+    // iterations to avoid overhead in tight inner loops.
+    // The counter is mutable so it can be updated from const methods.
+    mutable uint32_t budget_check_counter = 0;
+    mutable bool budget_cached = false;
+    bool budget_exceeded_gated() const {
+        if (++budget_check_counter % 64 == 0) {
+            budget_cached = budget_exceeded();
+        }
+        return budget_cached;
+    }
 };
 
 struct DestinationMatch {
@@ -1583,7 +1595,7 @@ void collect_transfer_itineraries(
     next_used_trip_ids.insert(departure.trip_id);
 
     for (const auto& transfer_row : transfer_rows) {
-        if (seen.size() >= kMaxGeneratedItineraries || ctx.budget_exceeded()) {
+        if (seen.size() >= kMaxGeneratedItineraries || ctx.budget_exceeded_gated()) {
             break;
         }
         if (destination_by_id.contains(transfer_row.stop_id)) {
@@ -1615,7 +1627,7 @@ void collect_transfer_itineraries(
             kTransferStopLimit
         );
         for (const auto& [transfer_board_stop, transfer_walk_m] : transfer_options) {
-            if (seen.size() >= kMaxGeneratedItineraries || ctx.budget_exceeded()) {
+            if (seen.size() >= kMaxGeneratedItineraries || ctx.budget_exceeded_gated()) {
                 break;
             }
             const int transfer_walk_seconds = walk_seconds(transfer_walk_m);
@@ -1701,7 +1713,7 @@ void build_transfer_itineraries(
         10
     );
     for (const auto& transfer_row : transfer_rows) {
-        if (ctx.budget_exceeded()) {
+        if (ctx.budget_exceeded_gated()) {
             break;
         }
         if (destination_by_id.contains(transfer_row.stop_id)) {
@@ -1733,7 +1745,7 @@ void build_transfer_itineraries(
             kTransferStopLimit
         );
         for (const auto& [transfer_board_stop, transfer_walk_m] : transfer_options) {
-            if (ctx.budget_exceeded()) {
+            if (ctx.budget_exceeded_gated()) {
                 break;
             }
             const int transfer_walk_seconds = walk_seconds(transfer_walk_m);
