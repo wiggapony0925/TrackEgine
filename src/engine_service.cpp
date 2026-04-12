@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cmath>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <limits>
@@ -355,37 +356,110 @@ std::string parent_stop_id(const std::string& stop_id) {
     return stop_id;
 }
 
-std::optional<std::string> subway_color_for_route(const std::string& route_id) {
-    static const std::unordered_map<std::string, std::string> kSubwayColors = {
-        {"1", "#EE352E"},
-        {"2", "#EE352E"},
-        {"3", "#EE352E"},
-        {"4", "#00933C"},
-        {"5", "#00933C"},
-        {"6", "#00933C"},
-        {"7", "#B933AD"},
-        {"A", "#0039A6"},
-        {"B", "#FF6319"},
-        {"C", "#0039A6"},
-        {"D", "#FF6319"},
-        {"E", "#0039A6"},
-        {"F", "#FF6319"},
-        {"G", "#6CBE45"},
-        {"J", "#996633"},
-        {"L", "#A7A9AC"},
-        {"M", "#FF6319"},
-        {"N", "#FCCC0A"},
-        {"Q", "#FCCC0A"},
-        {"R", "#FCCC0A"},
-        {"S", "#808183"},
-        {"SI", "#0039A6"},
-        {"W", "#FCCC0A"},
-        {"Z", "#996633"},
+// ── Brand colors loaded from config/brand_colors.json ──────────────
+// Falls back to compiled-in defaults if the JSON file is not available.
+
+struct BrandColorMaps {
+    std::unordered_map<std::string, std::string> subway;
+    std::unordered_map<std::string, std::string> mode_defaults;
+    bool loaded_from_file = false;
+};
+
+BrandColorMaps load_brand_colors() {
+    BrandColorMaps maps;
+
+    // Try env var first, then well-known relative paths
+    std::vector<std::string> candidates;
+    const char* env_path = std::getenv("TRACK_BRAND_COLORS_JSON");
+    if (env_path != nullptr && env_path[0] != '\0') {
+        candidates.emplace_back(env_path);
+    }
+    // Relative to working directory (common in development)
+    candidates.emplace_back("config/brand_colors.json");
+    candidates.emplace_back("../config/brand_colors.json");
+
+    for (const auto& path : candidates) {
+        if (!std::filesystem::exists(path)) continue;
+        try {
+            std::ifstream file(path);
+            if (!file.is_open()) continue;
+            const auto json = nlohmann::json::parse(file);
+            // Subway colors
+            if (json.contains("subway") && json["subway"].is_object()) {
+                for (const auto& [key, val] : json["subway"].items()) {
+                    if (val.is_string()) {
+                        maps.subway[key] = val.get<std::string>();
+                    }
+                }
+            }
+            // Mode defaults
+            if (json.contains("mode_defaults") && json["mode_defaults"].is_object()) {
+                for (const auto& [key, val] : json["mode_defaults"].items()) {
+                    if (val.is_string()) {
+                        maps.mode_defaults[key] = val.get<std::string>();
+                    }
+                }
+            }
+            maps.loaded_from_file = true;
+            log::info("BRAND", "Loaded brand colors from file", {
+                {"path", path},
+                {"subway_count", static_cast<int>(maps.subway.size())},
+            });
+            return maps;
+        } catch (const std::exception& e) {
+            log::warn("BRAND", "Failed to parse brand colors JSON", {
+                {"path", path},
+                {"error", e.what()},
+            });
+        }
+    }
+
+    // Fallback: compiled-in defaults (last known good from MTA API sync)
+    log::info("BRAND", "Using compiled-in brand color defaults", {});
+    maps.subway = {
+        {"1", "#D82233"}, {"2", "#D82233"}, {"3", "#D82233"},
+        {"4", "#009952"}, {"5", "#009952"}, {"5X", "#009952"},
+        {"6", "#009952"}, {"6X", "#009952"},
+        {"7", "#9A38A1"}, {"7X", "#9A38A1"},
+        {"A", "#0062CF"}, {"C", "#0062CF"}, {"E", "#0062CF"},
+        {"B", "#EB6800"}, {"D", "#EB6800"}, {"F", "#EB6800"},
+        {"FX", "#EB6800"}, {"M", "#EB6800"},
+        {"G", "#799534"},
+        {"J", "#8E5C33"}, {"Z", "#8E5C33"},
+        {"L", "#7C858C"},
+        {"N", "#F6BC26"}, {"Q", "#F6BC26"}, {"R", "#F6BC26"}, {"W", "#F6BC26"},
+        {"S", "#7C858C"}, {"GS", "#7C858C"}, {"FS", "#7C858C"},
+        {"SR", "#7C858C"}, {"H", "#7C858C"},
+        {"SI", "#08179C"}, {"SIR", "#08179C"}, {"T", "#008EB7"},
     };
-    if (const auto found = kSubwayColors.find(route_id); found != kSubwayColors.end()) {
+    maps.mode_defaults = {
+        {"subway", "#0062CF"}, {"bus", "#0078C6"},
+        {"lirr", "#0073BF"}, {"mnr", "#005A8C"},
+    };
+    return maps;
+}
+
+// Singleton brand color maps — initialized once at first use.
+const BrandColorMaps& brand_colors() {
+    static const BrandColorMaps instance = load_brand_colors();
+    return instance;
+}
+
+std::optional<std::string> subway_color_for_route(const std::string& route_id) {
+    const auto& subway = brand_colors().subway;
+    if (const auto found = subway.find(route_id); found != subway.end()) {
         return found->second;
     }
     return std::nullopt;
+}
+
+/// Brand color for non-subway transit modes.
+std::string brand_color_for_mode(const std::string& mode) {
+    const auto& defaults = brand_colors().mode_defaults;
+    if (const auto found = defaults.find(mode); found != defaults.end()) {
+        return found->second;
+    }
+    return "";
 }
 
 std::string infer_mode(
@@ -492,13 +566,26 @@ RouteMeta fetch_route(PlannerContext& ctx, const std::string& route_id) {
         const auto route_type = sqlite3_column_type(stmt, 4) == SQLITE_NULL
                                     ? std::optional<int>()
                                     : std::optional<int>(sqlite3_column_int(stmt, 4));
+        const auto mode = infer_mode(text_or_empty(stmt, 0), route_type, route_long_name);
+        // Use brand colors for known modes instead of raw GTFS route_color.
+        std::optional<std::string> resolved_color;
+        if (mode == "subway") {
+            resolved_color = subway_color_for_route(text_or_empty(stmt, 0));
+        }
+        if (!resolved_color) {
+            const auto bc = brand_color_for_mode(mode);
+            if (!bc.empty()) resolved_color = bc;
+        }
+        if (!resolved_color) {
+            resolved_color = normalize_color(route_color);
+        }
         meta = RouteMeta{
             .route_id = text_or_empty(stmt, 0),
             .route_name = route_display_name(text_or_empty(stmt, 0), route_short_name, route_long_name),
             .route_long_name = route_long_name.value_or(text_or_empty(stmt, 0)),
-            .color_hex = normalize_color(route_color),
+            .color_hex = resolved_color,
             .route_type = route_type,
-            .mode = infer_mode(text_or_empty(stmt, 0), route_type, route_long_name),
+            .mode = mode,
         };
     } else {
         // Route not in database — infer from route_id pattern.
@@ -2628,7 +2715,7 @@ PlanRequest plan_request_from_json(const nlohmann::json& payload) {
     request.max_transfers = payload.value("max_transfers", 2);
     request.max_origin_walk_m = payload.value("max_origin_walk_m", 1200);
     request.max_destination_walk_m = payload.value("max_destination_walk_m", 1200);
-    request.max_transfer_walk_m = payload.value("max_transfer_walk_m", 400);
+    request.max_transfer_walk_m = payload.value("max_transfer_walk_m", 250);
     request.search_window_minutes = payload.value("search_window_minutes", 180);
     request.num_itineraries = payload.value("num_itineraries", 3);
     request.modes.clear();
