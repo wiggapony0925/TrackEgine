@@ -25,8 +25,8 @@ constexpr double kEarthRadiusM = 6'371'009.0;
 constexpr double kWalkSpeedMps = 1.45;  // NYC walkers average ~3.2 mph
 constexpr int kMinTransferSeconds = 120;
 constexpr int kOriginDepartureLimit = 96;
-constexpr int kSecondLegDepartureLimit = 10;
-constexpr int kTransferStopLimit = 10;
+constexpr int kSecondLegDepartureLimit = 6;
+constexpr int kTransferStopLimit = 8;
 constexpr int kMaxIntermediateStops = 24;
 constexpr std::size_t kMaxGeneratedItineraries = 96;
 constexpr long long kPruningToleranceS = 900;  // 15 min tolerance for mode diversity
@@ -1258,6 +1258,17 @@ std::string itinerary_key(const Itinerary& itinerary) {
     return stream.str();
 }
 
+// Structural fingerprint: captures the route sequence without timestamps.
+// E.g. Q09→Q76 at different departure times share the same pattern key.
+std::string route_pattern_key(const Itinerary& itinerary) {
+    std::ostringstream stream;
+    for (const auto& leg : itinerary.legs) {
+        if (leg.mode == "walk") continue;
+        stream << leg.route_name << "|";
+    }
+    return stream.str();
+}
+
 bool departure_result_less(const Itinerary& left, const Itinerary& right) {
     return std::make_tuple(
                left.arrive_at_ts,
@@ -2358,6 +2369,31 @@ std::vector<Itinerary> EngineService::compute_itineraries(const PlanRequest& req
                    );
         });
     }
+    // ── Structural diversity: prefer unique route patterns ──
+    // Pick the best (earliest-arriving) instance of each distinct route
+    // pattern first, then backfill remaining slots with later departures
+    // of already-represented patterns.
+    {
+        const auto cap = static_cast<std::size_t>(request.num_itineraries);
+        std::vector<Itinerary> diverse;
+        std::vector<Itinerary> backfill;
+        std::unordered_set<std::string> seen_patterns;
+        for (auto& it : itineraries) {
+            const std::string pk = route_pattern_key(it);
+            if (!seen_patterns.contains(pk)) {
+                seen_patterns.insert(pk);
+                diverse.push_back(std::move(it));
+            } else {
+                backfill.push_back(std::move(it));
+            }
+        }
+        // Fill remaining slots with time-ordered duplicates.
+        for (auto& it : backfill) {
+            if (diverse.size() >= cap) break;
+            diverse.push_back(std::move(it));
+        }
+        itineraries = std::move(diverse);
+    }
     if (itineraries.size() > static_cast<std::size_t>(request.num_itineraries)) {
         itineraries.resize(static_cast<std::size_t>(request.num_itineraries));
     }
@@ -2458,7 +2494,7 @@ PlanRequest plan_request_from_json(const nlohmann::json& payload) {
     request.service_day_midnight_ts = payload.value("service_day_midnight_ts", 0LL);
     request.service_day_yyyymmdd = payload.value("service_day_yyyymmdd", 0);
     request.service_weekday = payload.value("service_weekday", 0);
-    request.max_transfers = payload.value("max_transfers", 1);
+    request.max_transfers = payload.value("max_transfers", 2);
     request.max_origin_walk_m = payload.value("max_origin_walk_m", 1200);
     request.max_destination_walk_m = payload.value("max_destination_walk_m", 1200);
     request.max_transfer_walk_m = payload.value("max_transfer_walk_m", 400);
