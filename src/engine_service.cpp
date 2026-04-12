@@ -1291,6 +1291,23 @@ std::string route_pattern_key(const Itinerary& itinerary) {
     return stream.str();
 }
 
+// Core-pattern fingerprint: includes only the dominant transit legs
+// (duration >= 5 min).  Short last-mile feeders are collapsed to "*"
+// so that A|J|Q10 and A|J|Q07 both map to A|J|*.
+std::string core_pattern_key(const Itinerary& itinerary) {
+    constexpr int kMinSignificantDurationS = 300;  // 5 minutes
+    std::ostringstream stream;
+    for (const auto& leg : itinerary.legs) {
+        if (leg.mode == "walk") continue;
+        if (leg.duration_s >= kMinSignificantDurationS) {
+            stream << leg.route_name << "|";
+        } else {
+            stream << "*|";
+        }
+    }
+    return stream.str();
+}
+
 bool departure_result_less(const Itinerary& left, const Itinerary& right) {
     return std::make_tuple(
                left.arrive_at_ts,
@@ -2424,26 +2441,57 @@ std::vector<Itinerary> EngineService::compute_itineraries(const PlanRequest& req
         });
     }
     // ── Structural diversity: prefer unique route patterns ──
-    // Pick the best (earliest-arriving) instance of each distinct route
-    // pattern first, then backfill remaining slots with later departures
-    // of already-represented patterns.
+    // Two-pass dedup:
+    //   Pass 1 — exact route_pattern_key  (A|J|Q10 ≠ A|J|Q07)
+    //   Pass 2 — core_pattern_key         (A|J|*  == A|J|*)
+    // This ensures we never return near-duplicate trips that only
+    // differ by a short last-mile feeder bus.
     {
         const auto cap = static_cast<std::size_t>(request.num_itineraries);
-        std::vector<Itinerary> diverse;
-        std::vector<Itinerary> backfill;
-        std::unordered_set<std::string> seen_patterns;
+
+        // Pass 1: exact pattern dedup (prefer first/best-arriving per pattern)
+        std::vector<Itinerary> pass1;
+        std::vector<Itinerary> backfill_exact;
+        std::unordered_set<std::string> seen_exact;
         for (auto& it : itineraries) {
             const std::string pk = route_pattern_key(it);
-            if (!seen_patterns.contains(pk)) {
-                seen_patterns.insert(pk);
-                diverse.push_back(std::move(it));
+            if (!seen_exact.contains(pk)) {
+                seen_exact.insert(pk);
+                pass1.push_back(std::move(it));
             } else {
-                backfill.push_back(std::move(it));
+                backfill_exact.push_back(std::move(it));
             }
         }
-        // Fill remaining slots with time-ordered duplicates.
-        for (auto& it : backfill) {
+
+        // Pass 2: core pattern dedup — collapse short feeders
+        std::vector<Itinerary> diverse;
+        std::vector<Itinerary> backfill_core;
+        std::unordered_set<std::string> seen_core;
+        for (auto& it : pass1) {
+            const std::string ck = core_pattern_key(it);
+            if (!seen_core.contains(ck)) {
+                seen_core.insert(ck);
+                diverse.push_back(std::move(it));
+            } else {
+                backfill_core.push_back(std::move(it));
+            }
+        }
+
+        // Fill remaining slots: first from core-deduped, then exact-deduped.
+        // Each backfill candidate is re-checked against seen_exact to avoid
+        // reintroducing an exact duplicate that was already picked.
+        for (auto& it : backfill_core) {
             if (diverse.size() >= cap) break;
+            const std::string pk = route_pattern_key(it);
+            if (seen_exact.contains(pk)) continue;  // already have this exact pattern
+            seen_exact.insert(pk);
+            diverse.push_back(std::move(it));
+        }
+        for (auto& it : backfill_exact) {
+            if (diverse.size() >= cap) break;
+            const std::string pk = route_pattern_key(it);
+            if (seen_exact.contains(pk)) continue;
+            seen_exact.insert(pk);
             diverse.push_back(std::move(it));
         }
         itineraries = std::move(diverse);
