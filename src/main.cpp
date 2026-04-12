@@ -1,4 +1,5 @@
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -68,6 +69,16 @@ int main() {
 
     server.Post("/plan", [&](const httplib::Request& request, httplib::Response& response) {
         trackengine::log::Timer timer;
+        if (!std::filesystem::exists(schedule_db_path)) {
+            json_response(response, 503, {
+                {"error", "engine_not_ready"},
+                {"detail", "Schedule database is still loading."},
+            });
+            trackengine::log::request("POST", "/plan", 503, timer.elapsed_ms(), {
+                {"reason", "db_not_ready"},
+            });
+            return;
+        }
         try {
             const auto payload = nlohmann::json::parse(request.body);
             const auto plan_request = trackengine::plan_request_from_json(payload);
@@ -99,6 +110,16 @@ int main() {
 
     server.Post("/go", [&](const httplib::Request& request, httplib::Response& response) {
         trackengine::log::Timer timer;
+        if (!std::filesystem::exists(schedule_db_path)) {
+            json_response(response, 503, {
+                {"error", "engine_not_ready"},
+                {"detail", "Schedule database is still loading."},
+            });
+            trackengine::log::request("POST", "/go", 503, timer.elapsed_ms(), {
+                {"reason", "db_not_ready"},
+            });
+            return;
+        }
         try {
             const auto payload = nlohmann::json::parse(request.body);
             const auto plan_request = trackengine::plan_request_from_json(payload);
