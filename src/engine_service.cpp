@@ -24,7 +24,7 @@ namespace {
 constexpr double kEarthRadiusM = 6'371'009.0;
 constexpr double kWalkSpeedMps = 1.45;  // NYC walkers average ~3.2 mph
 constexpr int kMinTransferSeconds = 120;
-constexpr int kOriginDepartureLimit = 64;
+constexpr int kOriginDepartureLimit = 96;
 constexpr int kSecondLegDepartureLimit = 10;
 constexpr int kTransferStopLimit = 10;
 constexpr int kMaxIntermediateStops = 24;
@@ -837,6 +837,7 @@ std::vector<StopCandidate> resolve_candidates(
     // For each requested mode, ensure at least a few stops are present
     // by running a mode-specific spatial query (EXISTS subquery, fast).
     constexpr std::size_t kPerModeMin = 4;
+    std::unordered_set<std::string> mode_augmented_ids;
     for (const auto& mode : modes) {
         auto mode_nearby = nearby_stops_for_mode(
             ctx, *location.lat, *location.lon, max_walk_m, mode, kPerModeMin
@@ -846,6 +847,7 @@ std::vector<StopCandidate> resolve_candidates(
                 continue;
             }
             seen.insert(stop.stop_id);
+            mode_augmented_ids.insert(stop.stop_id);
             candidates.push_back(StopCandidate{
                 .stop_id = stop.stop_id,
                 .stop_name = stop.stop_name,
@@ -860,14 +862,38 @@ std::vector<StopCandidate> resolve_candidates(
     std::sort(candidates.begin(), candidates.end(), [](const auto& left, const auto& right) {
         return std::tie(left.walk_seconds, left.stop_name) < std::tie(right.walk_seconds, right.stop_name);
     });
-    constexpr std::size_t kCandidateLimit = 8;
+    constexpr std::size_t kCandidateLimit = 12;
     constexpr double kCandidateSpacingM = 180.0;
     if (candidates.size() > kCandidateLimit) {
-        candidates = spatially_diverse_candidates(
-            candidates,
-            kCandidateLimit,
-            kCandidateSpacingM
-        );
+        // Split: mode-augmented stops are exempt from spatial diversity
+        // because a bus stop near a subway station is NOT a substitute.
+        std::vector<StopCandidate> general;
+        std::vector<StopCandidate> mode_essential;
+        for (auto& c : candidates) {
+            if (mode_augmented_ids.contains(c.stop_id)) {
+                mode_essential.push_back(std::move(c));
+            } else {
+                general.push_back(std::move(c));
+            }
+        }
+        const std::size_t general_limit =
+            kCandidateLimit > mode_essential.size()
+                ? kCandidateLimit - mode_essential.size()
+                : 0;
+        if (general.size() > general_limit) {
+            general = spatially_diverse_candidates(
+                general,
+                general_limit,
+                kCandidateSpacingM
+            );
+        }
+        candidates.clear();
+        candidates.reserve(general.size() + mode_essential.size());
+        for (auto& g : general) candidates.push_back(std::move(g));
+        for (auto& m : mode_essential) candidates.push_back(std::move(m));
+        std::sort(candidates.begin(), candidates.end(), [](const auto& left, const auto& right) {
+            return std::tie(left.walk_seconds, left.stop_name) < std::tie(right.walk_seconds, right.stop_name);
+        });
     }
     return candidates;
 }
@@ -1456,7 +1482,7 @@ void collect_transfer_itineraries(
     std::vector<Itinerary>& results,
     std::unordered_set<std::string>& seen
 ) {
-    if (seen.size() >= kMaxGeneratedItineraries || used_trip_ids.contains(departure.trip_id)) {
+    if (used_trip_ids.contains(departure.trip_id)) {
         return;
     }
 
@@ -1622,9 +1648,6 @@ void build_transfer_itineraries(
         10
     );
     for (const auto& transfer_row : transfer_rows) {
-        if (seen.size() >= kMaxGeneratedItineraries) {
-            break;
-        }
         if (destination_by_id.contains(transfer_row.stop_id)) {
             continue;
         }
@@ -1654,9 +1677,6 @@ void build_transfer_itineraries(
             kTransferStopLimit
         );
         for (const auto& [transfer_board_stop, transfer_walk_m] : transfer_options) {
-            if (seen.size() >= kMaxGeneratedItineraries) {
-                break;
-            }
             const int transfer_walk_seconds = walk_seconds(transfer_walk_m);
             const long long earliest_second_departure =
                 transfer_arrival_ts + transfer_walk_seconds + kMinTransferSeconds;
@@ -2104,7 +2124,6 @@ std::vector<Itinerary> EngineService::compute_itineraries(const PlanRequest& req
     }
 
     const auto origin_candidates = resolve_candidates(ctx, request.origin, request.max_origin_walk_m, request.modes);
-
     const auto destination_candidates = resolve_candidates(ctx, request.destination, request.max_destination_walk_m, request.modes);
     if (origin_candidates.empty() || destination_candidates.empty()) {
         return {};
