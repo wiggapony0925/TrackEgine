@@ -29,7 +29,8 @@ constexpr int kOriginDepartureLimit = 96;
 constexpr int kSecondLegDepartureLimit = 6;
 constexpr int kTransferStopLimit = 8;
 constexpr int kMaxIntermediateStops = 24;
-constexpr std::size_t kMaxGeneratedItineraries = 96;
+constexpr std::size_t kMaxGeneratedItineraries = 24;
+constexpr double kComputeBudgetMs = 5000.0;  // hard wall-clock limit
 constexpr long long kPruningToleranceS = 900;  // 15 min tolerance for mode diversity
 
 constexpr std::array<const char*, 7> kWeekdayColumns = {
@@ -157,6 +158,11 @@ struct PlannerContext {
     std::unordered_map<std::string, RouteMeta> route_cache;
     std::unordered_map<std::string, std::vector<StopTimeRow>> downstream_cache;
     std::unordered_map<std::string, std::vector<std::pair<StopRecord, double>>> transfer_stop_cache;
+    std::chrono::steady_clock::time_point deadline;
+
+    bool budget_exceeded() const {
+        return std::chrono::steady_clock::now() >= deadline;
+    }
 };
 
 struct DestinationMatch {
@@ -280,6 +286,12 @@ std::string route_display_name(
     const std::optional<std::string>& route_short_name,
     const std::optional<std::string>& route_long_name
 ) {
+    // NYC subway numbered lines 1-7 have colliding route metadata from
+    // commuter-rail imports (e.g. route "5" shows "Danbury" instead
+    // of "5").  Always use the route_id for these.
+    if (route_id.size() == 1 && route_id[0] >= '1' && route_id[0] <= '7') {
+        return route_id;
+    }
     if (route_short_name && !route_short_name->empty()) {
         return *route_short_name;
     }
@@ -374,6 +386,15 @@ std::string infer_mode(
         return "bus";
     }
     if ((route_type && *route_type == 1) || route_id == "SI") {
+        return "subway";
+    }
+    // NYC subway numbered lines 1–7 share route_ids with commuter-rail
+    // branches in merged GTFS feeds (e.g. route "1" can be either the
+    // subway 1 train or the Metro-North Hudson line).  Their trip data
+    // actually contains both, but the routes-table metadata was
+    // overwritten by the commuter-rail import.  Classify them as subway
+    // so the mode filter doesn't exclude them.
+    if (route_id.size() == 1 && route_id[0] >= '1' && route_id[0] <= '7') {
         return "subway";
     }
     if (route_type && *route_type == 2) {
@@ -1494,6 +1515,9 @@ void collect_transfer_itineraries(
     std::vector<Itinerary>& results,
     std::unordered_set<std::string>& seen
 ) {
+    if (ctx.budget_exceeded()) {
+        return;
+    }
     if (used_trip_ids.contains(departure.trip_id)) {
         return;
     }
@@ -1542,7 +1566,7 @@ void collect_transfer_itineraries(
     next_used_trip_ids.insert(departure.trip_id);
 
     for (const auto& transfer_row : transfer_rows) {
-        if (seen.size() >= kMaxGeneratedItineraries) {
+        if (seen.size() >= kMaxGeneratedItineraries || ctx.budget_exceeded()) {
             break;
         }
         if (destination_by_id.contains(transfer_row.stop_id)) {
@@ -1574,7 +1598,7 @@ void collect_transfer_itineraries(
             kTransferStopLimit
         );
         for (const auto& [transfer_board_stop, transfer_walk_m] : transfer_options) {
-            if (seen.size() >= kMaxGeneratedItineraries) {
+            if (seen.size() >= kMaxGeneratedItineraries || ctx.budget_exceeded()) {
                 break;
             }
             const int transfer_walk_seconds = walk_seconds(transfer_walk_m);
@@ -1660,6 +1684,9 @@ void build_transfer_itineraries(
         10
     );
     for (const auto& transfer_row : transfer_rows) {
+        if (ctx.budget_exceeded()) {
+            break;
+        }
         if (destination_by_id.contains(transfer_row.stop_id)) {
             continue;
         }
@@ -1689,6 +1716,9 @@ void build_transfer_itineraries(
             kTransferStopLimit
         );
         for (const auto& [transfer_board_stop, transfer_walk_m] : transfer_options) {
+            if (ctx.budget_exceeded()) {
+                break;
+            }
             const int transfer_walk_seconds = walk_seconds(transfer_walk_m);
             const long long earliest_second_departure =
                 transfer_arrival_ts + transfer_walk_seconds + kMinTransferSeconds;
@@ -2132,6 +2162,8 @@ std::vector<Itinerary> EngineService::compute_itineraries(const PlanRequest& req
     PlannerContext ctx{
         .db = connection.db,
         .stmts = std::make_unique<StatementCache>(connection.db),
+        .deadline = std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(static_cast<long long>(kComputeBudgetMs)),
     };
 
     const auto active_services = active_service_ids(ctx, request.service_day_yyyymmdd, request.service_weekday);
@@ -2230,6 +2262,9 @@ std::vector<Itinerary> EngineService::compute_itineraries(const PlanRequest& req
     std::unordered_set<std::string> modes_with_results;
 
     for (const auto& departure : departures) {
+        if (ctx.budget_exceeded()) {
+            break;
+        }
         const RouteMeta route_meta = fetch_route(ctx, departure.route_id);
         if (!request.modes.contains(route_meta.mode)) {
             continue;
@@ -2300,7 +2335,7 @@ std::vector<Itinerary> EngineService::compute_itineraries(const PlanRequest& req
                 }
             }
         }
-        if (has_missing_mode_departures) {
+        if (has_missing_mode_departures && !ctx.budget_exceeded()) {
             // Build a relaxed request with no effective pruning: set a very
             // large search window and no arrival-based cutoff by temporarily
             // collecting into a separate result vector.
@@ -2308,7 +2343,7 @@ std::vector<Itinerary> EngineService::compute_itineraries(const PlanRequest& req
             std::unordered_set<std::string> sup_seen = seen;  // keep existing dedup
 
             for (const auto& departure : departures) {
-                if (supplementary.size() >= 4) break;  // cap supplementary results
+                if (supplementary.size() >= 4 || ctx.budget_exceeded()) break;
                 const RouteMeta route_meta = fetch_route(ctx, departure.route_id);
                 if (!missing_modes.contains(route_meta.mode)) {
                     continue;  // only explore missing modes
@@ -2417,10 +2452,13 @@ std::vector<Itinerary> EngineService::compute_itineraries(const PlanRequest& req
         itineraries.resize(static_cast<std::size_t>(request.num_itineraries));
     }
 
+    const bool budget_hit = ctx.budget_exceeded();
+
     log::info("PLAN", "compute_itineraries done", {
         {"total_ms", std::round(total_timer.elapsed_ms() * 10.0) / 10.0},
         {"services_ms", std::round(services_ms * 10.0) / 10.0},
         {"candidates_ms", std::round(candidates_ms * 10.0) / 10.0},
+        {"budget_exceeded", budget_hit},
         {"origin", request.origin.label},
         {"destination", request.destination.label},
         {"origin_stops", origin_candidates.size()},
