@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <set>
 #include <sstream>
@@ -609,15 +610,20 @@ std::vector<std::pair<StopRecord, double>> nearby_stops_for_mode(
     const auto [lat_delta, lon_delta] = bounding_box_degrees(radius_m, lat);
 
     // Map mode → route_type SQL condition
-    std::string route_type_condition;
+    std::string stop_mode_condition;
+    std::string route_filter_condition;
     if (mode == "bus") {
-        route_type_condition =
+        stop_mode_condition =
             "(sm.route_type = 3 OR (sm.route_type >= 700 AND sm.route_type <= 799))";
+        route_filter_condition =
+            "(r.route_type = 3 OR (r.route_type >= 700 AND r.route_type <= 799))";
     } else if (mode == "subway") {
-        route_type_condition = "(sm.route_type = 1)";
+        stop_mode_condition = "(sm.route_type = 1)";
+        route_filter_condition = "(r.route_type = 1 OR r.route_id IN ('SI', 'SIR'))";
     } else {
         // lirr, mnr — both GTFS route_type 2
-        route_type_condition = "(sm.route_type = 2)";
+        stop_mode_condition = "(sm.route_type = 2)";
+        route_filter_condition = "(r.route_type = 2)";
     }
 
     const std::string sql =
@@ -626,21 +632,33 @@ std::vector<std::pair<StopRecord, double>> nearby_stops_for_mode(
         "JOIN stop_modes sm ON sm.stop_id = s.stop_id "
         "WHERE s.stop_lat BETWEEN ? AND ? "
         "AND s.stop_lon BETWEEN ? AND ? "
-        "AND " + route_type_condition;
+        "AND " + stop_mode_condition;
 
     // The stop_modes table is created by prepare_schedule_db.sh.
-    // If it doesn't exist yet, gracefully return an empty set.
+    // If it doesn't exist yet, fall back to a direct join so routing still
+    // works against partially prepared databases.
     sqlite3_stmt* raw_stmt = nullptr;
     const int rc = sqlite3_prepare_v2(ctx.db, sql.c_str(), -1, &raw_stmt, nullptr);
-    if (rc != SQLITE_OK || raw_stmt == nullptr) {
-        if (raw_stmt != nullptr) {
-            sqlite3_finalize(raw_stmt);
-        }
-        return {};  // stop_modes table missing — not an error
+    const bool has_stop_modes = rc == SQLITE_OK && raw_stmt != nullptr;
+    if (raw_stmt != nullptr) {
+        sqlite3_finalize(raw_stmt);
     }
-    sqlite3_finalize(raw_stmt);  // we just validated; use cache below
 
-    auto* stmt = ctx.stmts->prepare(sql);
+    sqlite3_stmt* stmt = nullptr;
+    if (has_stop_modes) {
+        stmt = ctx.stmts->prepare(sql);
+    } else {
+        const std::string fallback_sql =
+            "SELECT DISTINCT s.stop_id, s.stop_name, s.stop_lat, s.stop_lon "
+            "FROM stops s "
+            "JOIN stop_times st ON st.stop_id = s.stop_id "
+            "JOIN trips t ON t.trip_id = st.trip_id "
+            "JOIN routes r ON r.route_id = t.route_id "
+            "WHERE s.stop_lat BETWEEN ? AND ? "
+            "AND s.stop_lon BETWEEN ? AND ? "
+            "AND " + route_filter_condition;
+        stmt = ctx.stmts->prepare(fallback_sql);
+    }
     sqlite3_bind_double(stmt, 1, lat - lat_delta);
     sqlite3_bind_double(stmt, 2, lat + lat_delta);
     sqlite3_bind_double(stmt, 3, lon - lon_delta);
@@ -673,6 +691,52 @@ double distance_to_stop(const LocationInput& location, const StopRecord& stop) {
         return 0.0;
     }
     return haversine_m(*location.lat, *location.lon, stop.lat, stop.lon);
+}
+
+std::vector<StopCandidate> spatially_diverse_candidates(
+    const std::vector<StopCandidate>& candidates,
+    std::size_t limit,
+    double min_spacing_m
+) {
+    if (candidates.size() <= limit) {
+        return candidates;
+    }
+
+    std::vector<StopCandidate> selected;
+    std::vector<StopCandidate> deferred;
+    selected.reserve(limit);
+    deferred.reserve(candidates.size());
+
+    for (const auto& candidate : candidates) {
+        const bool too_close = std::any_of(
+            selected.begin(),
+            selected.end(),
+            [&](const StopCandidate& kept) {
+                return haversine_m(
+                           candidate.lat,
+                           candidate.lon,
+                           kept.lat,
+                           kept.lon
+                       ) < min_spacing_m;
+            }
+        );
+        if (too_close) {
+            deferred.push_back(candidate);
+            continue;
+        }
+        selected.push_back(candidate);
+        if (selected.size() >= limit) {
+            return selected;
+        }
+    }
+
+    for (const auto& candidate : deferred) {
+        if (selected.size() >= limit) {
+            break;
+        }
+        selected.push_back(candidate);
+    }
+    return selected;
 }
 
 // ── Parent-station expansion ──────────────────────────────────────
@@ -796,8 +860,14 @@ std::vector<StopCandidate> resolve_candidates(
     std::sort(candidates.begin(), candidates.end(), [](const auto& left, const auto& right) {
         return std::tie(left.walk_seconds, left.stop_name) < std::tie(right.walk_seconds, right.stop_name);
     });
-    if (candidates.size() > 20) {
-        candidates.resize(20);
+    constexpr std::size_t kCandidateLimit = 8;
+    constexpr double kCandidateSpacingM = 180.0;
+    if (candidates.size() > kCandidateLimit) {
+        candidates = spatially_diverse_candidates(
+            candidates,
+            kCandidateLimit,
+            kCandidateSpacingM
+        );
     }
     return candidates;
 }
@@ -961,6 +1031,26 @@ std::optional<DestinationMatch> best_destination_match(
     return best;
 }
 
+double min_destination_distance_m(
+    const StopRecord& stop,
+    const std::unordered_map<std::string, StopCandidate>& destination_by_id
+) {
+    double best = std::numeric_limits<double>::infinity();
+    for (const auto& [stop_id, destination] : destination_by_id) {
+        (void)stop_id;
+        best = std::min(
+            best,
+            haversine_m(
+                stop.lat,
+                stop.lon,
+                destination.lat,
+                destination.lon
+            )
+        );
+    }
+    return best;
+}
+
 std::vector<StopTimeRow> select_transfer_rows(const std::vector<StopTimeRow>& downstream) {
     if (downstream.size() <= static_cast<std::size_t>(kMaxIntermediateStops)) {
         return downstream;
@@ -983,6 +1073,74 @@ std::vector<StopTimeRow> select_transfer_rows(const std::vector<StopTimeRow>& do
         deduped.push_back(row);
     }
     return deduped;
+}
+
+std::vector<StopTimeRow> prioritize_transfer_rows(
+    PlannerContext& ctx,
+    const std::vector<StopTimeRow>& transfer_rows,
+    const std::unordered_map<std::string, StopCandidate>& destination_by_id,
+    std::size_t limit
+) {
+    if (transfer_rows.size() <= limit || destination_by_id.empty()) {
+        if (transfer_rows.size() <= limit) {
+            return transfer_rows;
+        }
+        return {
+            transfer_rows.begin(),
+            transfer_rows.begin() + static_cast<std::ptrdiff_t>(limit),
+        };
+    }
+
+    struct RankedTransferRow {
+        StopTimeRow row;
+        double destination_distance_m = std::numeric_limits<double>::infinity();
+    };
+
+    std::vector<RankedTransferRow> ranked;
+    ranked.reserve(transfer_rows.size());
+    for (const auto& row : transfer_rows) {
+        const auto stop = fetch_stop(ctx, row.stop_id);
+        ranked.push_back(RankedTransferRow{
+            .row = row,
+            .destination_distance_m = stop
+                ? min_destination_distance_m(*stop, destination_by_id)
+                : std::numeric_limits<double>::infinity(),
+        });
+    }
+
+    std::sort(ranked.begin(), ranked.end(), [](const RankedTransferRow& left, const RankedTransferRow& right) {
+        return std::tie(
+                   left.destination_distance_m,
+                   left.row.stop_sequence,
+                   left.row.stop_id
+               ) < std::tie(
+                   right.destination_distance_m,
+                   right.row.stop_sequence,
+                   right.row.stop_id
+               );
+    });
+    if (ranked.size() > limit) {
+        ranked.resize(limit);
+    }
+
+    std::sort(ranked.begin(), ranked.end(), [](const RankedTransferRow& left, const RankedTransferRow& right) {
+        return std::tie(
+                   left.row.stop_sequence,
+                   left.destination_distance_m,
+                   left.row.stop_id
+               ) < std::tie(
+                   right.row.stop_sequence,
+                   right.destination_distance_m,
+                   right.row.stop_id
+               );
+    });
+
+    std::vector<StopTimeRow> prioritized;
+    prioritized.reserve(ranked.size());
+    for (const auto& entry : ranked) {
+        prioritized.push_back(entry.row);
+    }
+    return prioritized;
 }
 
 TransitLeg make_walk_leg(
@@ -1336,7 +1494,12 @@ void collect_transfer_itineraries(
         return;
     }
     const auto& downstream = downstream_stop_times(ctx, departure.trip_id, departure.stop_sequence);
-    const auto transfer_rows = select_transfer_rows(downstream);
+    const auto transfer_rows = prioritize_transfer_rows(
+        ctx,
+        select_transfer_rows(downstream),
+        destination_by_id,
+        10
+    );
     auto next_used_trip_ids = used_trip_ids;
     next_used_trip_ids.insert(departure.trip_id);
 
@@ -1452,7 +1615,12 @@ void build_transfer_itineraries(
         return;
     }
     const auto& downstream = downstream_stop_times(ctx, departure.trip_id, departure.stop_sequence);
-    const auto transfer_rows = select_transfer_rows(downstream);
+    const auto transfer_rows = prioritize_transfer_rows(
+        ctx,
+        select_transfer_rows(downstream),
+        destination_by_id,
+        10
+    );
     for (const auto& transfer_row : transfer_rows) {
         if (seen.size() >= kMaxGeneratedItineraries) {
             break;
