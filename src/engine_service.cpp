@@ -1318,7 +1318,7 @@ TransitLeg make_walk_leg(
     };
 }
 
-Itinerary finalize_itinerary(std::vector<TransitLeg> legs) {
+Itinerary finalize_itinerary(std::vector<TransitLeg> legs, const std::string& priority = {}, bool accessibility_priority = false) {
     const long long leave_at_ts = legs.front().departure_ts;
     const long long arrive_at_ts = legs.back().arrival_ts;
     const int total_duration_s = static_cast<int>(arrive_at_ts - leave_at_ts);
@@ -1341,6 +1341,27 @@ Itinerary finalize_itinerary(std::vector<TransitLeg> legs) {
     }
     const int transfer_count = std::max(0, transit_legs - 1);
     const int waiting_s = std::max(0, total_duration_s - in_vehicle_s - walking_s);
+
+    // Priority-aware scoring: lower is better.
+    // Base score: arrival time (quickest wins).
+    // Transfer penalty and walk penalty are tuned per priority.
+    double transfer_penalty = 300.0;
+    double walk_penalty = 1.0;
+    if (priority == "fewer_transfers") {
+        transfer_penalty = 1200.0;  // 20 min equivalent per transfer
+    } else if (priority == "less_walking") {
+        walk_penalty = 3.0;         // triple walking cost
+    }
+    // When accessibility is prioritized, strongly prefer routes with
+    // fewer transfers — each transfer means navigating a station
+    // that may not be wheelchair-accessible.
+    if (accessibility_priority) {
+        transfer_penalty = std::max(transfer_penalty, 1500.0);
+    }
+    const double score_value = static_cast<double>(arrive_at_ts)
+        + transfer_count * transfer_penalty
+        + walk_meters_value * walk_penalty;
+
     std::ostringstream summary;
     for (std::size_t index = 0; index < summary_parts.size(); ++index) {
         if (index > 0) {
@@ -1359,7 +1380,7 @@ Itinerary finalize_itinerary(std::vector<TransitLeg> legs) {
         .waiting_s = waiting_s,
         .transfer_count = transfer_count,
         .walk_meters = walk_meters_value,
-        .score = static_cast<double>(arrive_at_ts + transfer_count * 300 + static_cast<int>(walk_meters_value)),
+        .score = score_value,
         .summary = summary_value,
         .legs = std::move(legs),
     };
@@ -1408,6 +1429,13 @@ std::string core_pattern_key(const Itinerary& itinerary) {
 }
 
 bool departure_result_less(const Itinerary& left, const Itinerary& right) {
+    // Use the priority-aware score as primary sort key.
+    // For "quick" (default), score ≈ arrival time, so this naturally
+    // sorts by earliest arrival.  For "fewer_transfers" / "less_walking"
+    // the heavier penalties reorder routes favorably.
+    if (left.score != right.score) {
+        return left.score < right.score;
+    }
     return std::make_tuple(
                left.arrive_at_ts,
                left.transfer_count,
@@ -1596,7 +1624,7 @@ std::optional<Itinerary> build_prefixed_direct_itinerary(
             destination_match->candidate.walk_meters
         ));
     }
-    return finalize_itinerary(std::move(legs));
+    return finalize_itinerary(std::move(legs), request.priority, request.accessibility_priority);
 }
 
 std::optional<Itinerary> build_direct_itinerary(
@@ -2527,17 +2555,7 @@ std::vector<Itinerary> EngineService::compute_itineraries(const PlanRequest& req
                    );
         });
     } else {
-        std::sort(itineraries.begin(), itineraries.end(), [](const Itinerary& left, const Itinerary& right) {
-            return std::make_tuple(
-                       left.arrive_at_ts,
-                       left.transfer_count,
-                       left.walk_meters
-                   ) < std::make_tuple(
-                       right.arrive_at_ts,
-                       right.transfer_count,
-                       right.walk_meters
-                   );
-        });
+        std::sort(itineraries.begin(), itineraries.end(), departure_result_less);
     }
     // ── Structural diversity: prefer unique route patterns ──
     // Two-pass dedup:
@@ -2613,6 +2631,8 @@ std::vector<Itinerary> EngineService::compute_itineraries(const PlanRequest& req
         {"departures", departures.size()},
         {"itineraries", itineraries.size()},
         {"max_transfers", request.max_transfers},
+        {"priority", request.priority.empty() ? "quick" : request.priority},
+        {"accessibility_priority", request.accessibility_priority},
     });
 
     return itineraries;
@@ -2727,6 +2747,8 @@ PlanRequest plan_request_from_json(const nlohmann::json& payload) {
     if (request.modes.empty()) {
         request.modes = {"subway", "bus", "lirr", "mnr"};
     }
+    request.priority = payload.value("priority", std::string{});
+    request.accessibility_priority = payload.value("accessibility_priority", false);
     return request;
 }
 

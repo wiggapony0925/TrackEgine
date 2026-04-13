@@ -35,6 +35,8 @@ struct PlanRequest {
     int search_window_minutes = 180;
     int num_itineraries = 3;
     std::unordered_set<std::string> modes = {"subway", "bus", "lirr", "mnr"};
+    std::string priority;  // "quick" (default), "fewer_transfers", "less_walking"
+    bool accessibility_priority = false;
 };
 
 struct StopRecord {
