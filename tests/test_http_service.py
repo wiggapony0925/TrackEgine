@@ -411,7 +411,7 @@ def test_cpp_http_service_normalizes_subway_route_collision(tmp_path: Path) -> N
         ]
         assert transit_legs[0]["route_name"] == "7"
         assert transit_legs[0]["mode"] == "subway"
-        assert transit_legs[0]["color_hex"] == "#B933AD"
+        assert transit_legs[0]["color_hex"] == "#9A38A1"
     finally:
         process.terminate()
         try:

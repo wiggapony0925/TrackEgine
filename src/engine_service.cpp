@@ -1,5 +1,8 @@
 #include "trackengine/engine_service.hpp"
+#include "trackengine/csa.hpp"
 #include "trackengine/logger.hpp"
+#include "trackengine/raptor.hpp"
+#include "trackengine/schedule_store.hpp"
 
 #include <algorithm>
 #include <array>
@@ -2260,7 +2263,25 @@ nlohmann::json go_trip_to_json(
 }  // namespace
 
 EngineService::EngineService(std::string schedule_db_path)
-    : schedule_db_path_(std::move(schedule_db_path)) {}
+    : schedule_db_path_(std::move(schedule_db_path)) {
+    // Eagerly load the in-memory schedule store for RAPTOR / CSA.
+    try {
+        auto store = std::make_shared<ScheduleStore>(schedule_db_path_);
+        if (store->loaded()) {
+            store_ = std::move(store);
+            log::info("BOOT", "In-memory ScheduleStore ready", {
+                {"stops", store_->stop_count()},
+                {"routes", store_->route_count()},
+                {"patterns", store_->patterns().size()},
+                {"connections", store_->connections().size()},
+            });
+        }
+    } catch (const std::exception& e) {
+        log::warn("BOOT", "ScheduleStore unavailable, using SQLite fallback", {
+            {"error", e.what()},
+        });
+    }
+}
 
 const char* EngineService::version() {
     return "0.9.0";
@@ -2298,7 +2319,88 @@ HealthStatus EngineService::health() const {
     return health;
 }
 
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  RAPTOR + CSA optimized path (in-memory, multi-threaded)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+std::vector<Itinerary> EngineService::compute_itineraries_raptor(
+    const PlanRequest& request
+) const {
+    if (!store_ || !store_->loaded()) return {};
+
+    log::Timer timer;
+
+    // 1. Active services
+    const auto active = store_->active_services(
+        request.service_day_yyyymmdd, request.service_weekday);
+    if (active.empty()) return {};
+
+    // 2. Resolve origin / destination candidates from in-memory store
+    auto resolve = [&](const LocationInput& loc, int max_walk) -> std::vector<StopCandidate> {
+        std::vector<StopCandidate> out;
+        // If explicit stop_id, try it first
+        if (loc.stop_id) {
+            auto idx = store_->stop_idx(*loc.stop_id);
+            if (idx) {
+                const auto& s = store_->stop(*idx);
+                double dist = 0.0;
+                if (loc.lat && loc.lon)
+                    dist = haversine_m(*loc.lat, *loc.lon, s.lat, s.lon);
+                out.push_back(StopCandidate{
+                    s.stop_id, s.stop_name, s.lat, s.lon,
+                    dist, walk_seconds(dist)});
+            }
+        }
+        if (!loc.lat || !loc.lon) return out;
+        auto nearby = store_->nearby_stops(*loc.lat, *loc.lon, max_walk, 12);
+        std::unordered_set<std::string> seen;
+        for (const auto& c : out) seen.insert(c.stop_id);
+        for (const auto& [idx, dist] : nearby) {
+            const auto& s = store_->stop(idx);
+            if (seen.count(s.stop_id)) continue;
+            seen.insert(s.stop_id);
+            out.push_back(StopCandidate{
+                s.stop_id, s.stop_name, s.lat, s.lon,
+                dist, walk_seconds(dist)});
+        }
+        return out;
+    };
+
+    auto origin_cands = resolve(request.origin, request.max_origin_walk_m);
+    auto dest_cands   = resolve(request.destination, request.max_destination_walk_m);
+    if (origin_cands.empty() || dest_cands.empty()) return {};
+
+    // 3. CSA pre-filter: compute earliest possible arrival at every stop
+    ConnectionScanner csa(*store_);
+    std::vector<std::pair<uint32_t, long long>> csa_origins;
+    for (const auto& c : origin_cands) {
+        auto idx = store_->stop_idx(c.stop_id);
+        if (idx) csa_origins.emplace_back(*idx, request.query_ts + c.walk_seconds);
+    }
+    const std::unordered_set<std::string> active_set(active.begin(), active.end());
+    auto csa_bounds = csa.scan(csa_origins, active_set, request.service_day_midnight_ts);
+
+    // 4. RAPTOR multi-criteria routing
+    RaptorRouter raptor(*store_);
+    auto itineraries = raptor.route(
+        request, origin_cands, dest_cands, active, csa_bounds);
+
+    log::info("PLAN", "RAPTOR path used", {
+        {"itineraries", itineraries.size()},
+        {"elapsed_ms", std::round(timer.elapsed_ms() * 10.0) / 10.0},
+    });
+    return itineraries;
+}
+
 std::vector<Itinerary> EngineService::compute_itineraries(const PlanRequest& request) const {
+    // ── Try RAPTOR (in-memory) path first ────────────────────────
+    if (store_ && store_->loaded()) {
+        auto raptor_results = compute_itineraries_raptor(request);
+        if (!raptor_results.empty()) return raptor_results;
+        log::info("PLAN", "RAPTOR yielded no results, falling back to SQLite", {});
+    }
+
+    // ── SQLite fallback (original algorithm) ─────────────────────
     log::Timer total_timer;
     log::Timer phase_timer;
 

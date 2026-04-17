@@ -1,5 +1,6 @@
 #pragma once
 
+#include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -7,6 +8,8 @@
 #include <vector>
 
 #include "nlohmann/json.hpp"
+
+namespace trackengine { class ScheduleStore; }  // forward-declare
 
 namespace trackengine {
 
@@ -134,7 +137,9 @@ public:
 
 private:
     std::vector<Itinerary> compute_itineraries(const PlanRequest& request) const;
+    std::vector<Itinerary> compute_itineraries_raptor(const PlanRequest& request) const;
     std::string schedule_db_path_;
+    std::shared_ptr<ScheduleStore> store_;
 };
 
 nlohmann::json health_to_json(const HealthStatus& health);

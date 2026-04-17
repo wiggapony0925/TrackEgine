@@ -22,6 +22,9 @@ c++ \
   -I"${ROOT_DIR}/third_party" \
   "${ROOT_DIR}/src/main.cpp" \
   "${ROOT_DIR}/src/engine_service.cpp" \
+  "${ROOT_DIR}/src/schedule_store.cpp" \
+  "${ROOT_DIR}/src/raptor.cpp" \
+  "${ROOT_DIR}/src/csa.cpp" \
   "${ROOT_DIR}/src/logger.cpp" \
   -lsqlite3 \
   -o "${BIN_PATH}"
