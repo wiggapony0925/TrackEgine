@@ -21,10 +21,13 @@ public:
 
     /// Returns earliest arrival timestamp at every stop reachable
     /// from the given origin stops.  Unreachable stops have LLONG_MAX.
+    /// @param route_allowed  Per-route bitmap; only connections on allowed
+    ///                       routes are scanned (empty = allow all).
     std::vector<long long> scan(
         const std::vector<std::pair<uint32_t, long long>>& origin_arrivals,
         const std::unordered_set<std::string>& active_services,
-        long long midnight_ts
+        long long midnight_ts,
+        const std::vector<bool>& route_allowed = {}
     ) const;
 
 private:

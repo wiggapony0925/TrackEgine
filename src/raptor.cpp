@@ -191,6 +191,10 @@ std::vector<Itinerary> RaptorRouter::route(
 
     const int max_rounds = request.max_transfers + 1;
     const long long midnight = request.service_day_midnight_ts;
+    // Departure time window: only consider trips departing within the
+    // configured search window.  This prevents scanning trips hours away.
+    const long long latest_departure_ts = request.query_ts +
+        static_cast<long long>(request.search_window_minutes) * 60;
 
     // ── Active trip bitmap ───────────────────────────────────────
     const std::unordered_set<std::string> active_set(
@@ -311,6 +315,7 @@ std::vector<Itinerary> RaptorRouter::route(
                              t < static_cast<int>(pat.trips.size()); ++t) {
                             if (!trip_active[pat.trips[t].trip_idx]) continue;
                             const long long dep = midnight + pat.trips[t].times[pos * 2];
+                            if (dep > latest_departure_ts) break;  // past search window
                             if (dep >= earliest_board) {
                                 if (current_trip < 0 || dep < (midnight + pat.trips[current_trip].times[pos * 2])) {
                                     current_trip = t;

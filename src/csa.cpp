@@ -17,7 +17,8 @@ ConnectionScanner::ConnectionScanner(const ScheduleStore& store)
 std::vector<long long> ConnectionScanner::scan(
     const std::vector<std::pair<uint32_t, long long>>& origin_arrivals,
     const std::unordered_set<std::string>& active_services,
-    long long midnight_ts
+    long long midnight_ts,
+    const std::vector<bool>& route_allowed
 ) const {
     const uint32_t n = store_.stop_count();
     const long long INF = std::numeric_limits<long long>::max();
@@ -39,6 +40,9 @@ std::vector<long long> ConnectionScanner::scan(
     // Single forward scan over all connections (sorted by departure_s)
     for (const auto& conn : store_.connections()) {
         if (!trip_ok[conn.trip_idx]) continue;
+        // Mode filter: skip connections on disallowed routes
+        if (!route_allowed.empty() && conn.route_idx < route_allowed.size()
+            && !route_allowed[conn.route_idx]) continue;
 
         const long long dep_ts = midnight_ts + conn.departure_s;
         const long long arr_ts = midnight_ts + conn.arrival_s;

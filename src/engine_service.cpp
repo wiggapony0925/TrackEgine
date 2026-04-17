@@ -2370,7 +2370,12 @@ std::vector<Itinerary> EngineService::compute_itineraries_raptor(
     auto dest_cands   = resolve(request.destination, request.max_destination_walk_m);
     if (origin_cands.empty() || dest_cands.empty()) return {};
 
-    // 3. CSA pre-filter: compute earliest possible arrival at every stop
+    // 3. Build mode filter for routes (shared by CSA + RAPTOR)
+    std::vector<bool> route_allowed(store_->route_count(), false);
+    for (uint32_t i = 0; i < store_->route_count(); ++i)
+        route_allowed[i] = request.modes.count(store_->route(i).mode) > 0;
+
+    // 4. CSA pre-filter: compute earliest possible arrival at every stop
     ConnectionScanner csa(*store_);
     std::vector<std::pair<uint32_t, long long>> csa_origins;
     for (const auto& c : origin_cands) {
@@ -2378,12 +2383,76 @@ std::vector<Itinerary> EngineService::compute_itineraries_raptor(
         if (idx) csa_origins.emplace_back(*idx, request.query_ts + c.walk_seconds);
     }
     const std::unordered_set<std::string> active_set(active.begin(), active.end());
-    auto csa_bounds = csa.scan(csa_origins, active_set, request.service_day_midnight_ts);
+    auto csa_bounds = csa.scan(csa_origins, active_set,
+                               request.service_day_midnight_ts, route_allowed);
 
-    // 4. RAPTOR multi-criteria routing
+    // 5. RAPTOR multi-criteria routing
     RaptorRouter raptor(*store_);
     auto itineraries = raptor.route(
         request, origin_cands, dest_cands, active, csa_bounds);
+
+    // 6. Post-processing: apply the same filters as the SQLite path
+    //    so behaviour is identical regardless of which path runs.
+
+    // arrive_by filtering
+    if (request.arrive_by_ts) {
+        itineraries.erase(
+            std::remove_if(itineraries.begin(), itineraries.end(),
+                [&](const Itinerary& it) {
+                    return it.arrive_at_ts > *request.arrive_by_ts;
+                }),
+            itineraries.end());
+        // Sort: latest departure first (users want the closest-to-deadline trip)
+        std::sort(itineraries.begin(), itineraries.end(),
+            [](const Itinerary& a, const Itinerary& b) {
+                return std::make_tuple(-a.leave_at_ts, a.total_duration_s,
+                                       a.transfer_count, a.walk_meters)
+                     < std::make_tuple(-b.leave_at_ts, b.total_duration_s,
+                                       b.transfer_count, b.walk_meters);
+            });
+    } else {
+        std::sort(itineraries.begin(), itineraries.end(), departure_result_less);
+    }
+
+    // Structural diversity: exact pattern ➜ core pattern dedup
+    {
+        const auto cap = static_cast<std::size_t>(request.num_itineraries);
+        std::vector<Itinerary> pass1;
+        std::vector<Itinerary> backfill_exact;
+        std::unordered_set<std::string> seen_exact;
+        for (auto& it : itineraries) {
+            const std::string pk = route_pattern_key(it);
+            if (!seen_exact.contains(pk)) { seen_exact.insert(pk); pass1.push_back(std::move(it)); }
+            else { backfill_exact.push_back(std::move(it)); }
+        }
+        std::vector<Itinerary> diverse;
+        std::unordered_set<std::string> seen_core;
+        std::vector<Itinerary> backfill_core;
+        for (auto& it : pass1) {
+            const std::string ck = core_pattern_key(it);
+            if (!seen_core.contains(ck)) { seen_core.insert(ck); diverse.push_back(std::move(it)); }
+            else { backfill_core.push_back(std::move(it)); }
+        }
+        for (auto& it : backfill_core) {
+            if (diverse.size() >= cap) break;
+            const std::string pk = route_pattern_key(it);
+            if (seen_exact.contains(pk)) continue;
+            seen_exact.insert(pk);
+            diverse.push_back(std::move(it));
+        }
+        for (auto& it : backfill_exact) {
+            if (diverse.size() >= cap) break;
+            const std::string pk = route_pattern_key(it);
+            if (seen_exact.contains(pk)) continue;
+            seen_exact.insert(pk);
+            diverse.push_back(std::move(it));
+        }
+        itineraries = std::move(diverse);
+    }
+
+    // Final cap
+    if (itineraries.size() > static_cast<std::size_t>(request.num_itineraries))
+        itineraries.resize(static_cast<std::size_t>(request.num_itineraries));
 
     log::info("PLAN", "RAPTOR path used", {
         {"itineraries", itineraries.size()},
