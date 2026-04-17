@@ -17,6 +17,9 @@ add_executable(trackengine
     src/main.cpp
     src/engine_service.cpp
     src/logger.cpp
+    src/raptor.cpp
+    src/csa.cpp
+    src/schedule_store.cpp
 )
 
 target_include_directories(trackengine

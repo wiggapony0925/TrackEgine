@@ -1348,7 +1348,7 @@ Itinerary finalize_itinerary(std::vector<TransitLeg> legs, const std::string& pr
     // Priority-aware scoring: lower is better.
     // Base score: arrival time (quickest wins).
     // Transfer penalty and walk penalty are tuned per priority.
-    double transfer_penalty = 300.0;
+    double transfer_penalty = 600.0;  // 10 min equivalent per transfer
     double walk_penalty = 1.0;
     if (priority == "fewer_transfers") {
         transfer_penalty = 1200.0;  // 20 min equivalent per transfer
@@ -2696,10 +2696,18 @@ std::vector<Itinerary> EngineService::compute_itineraries(const PlanRequest& req
                     }
                 }
             }
-            // Sort supplementary by arrival time, keep best 2 per missing mode
+            // Sort supplementary by arrival time, keep best 2 per missing mode.
+            // Gate: only append supplementary itineraries that are within 50%
+            // of the best main itinerary's duration — avoids suggesting
+            // drastically slower bus alternatives.
             std::sort(supplementary.begin(), supplementary.end(), departure_result_less);
+            const int best_dur = itineraries.empty() ? 0 : itineraries.front().total_duration_s;
+            const int sup_max_dur = best_dur > 0
+                ? static_cast<int>(best_dur * 1.5)
+                : std::numeric_limits<int>::max();
             for (const auto& it : supplementary) {
                 if (itineraries.size() >= static_cast<std::size_t>(request.num_itineraries) + 2) break;
+                if (it.total_duration_s > sup_max_dur) continue;  // too slow
                 itineraries.push_back(it);
             }
         }
@@ -2784,6 +2792,58 @@ std::vector<Itinerary> EngineService::compute_itineraries(const PlanRequest& req
         }
         itineraries = std::move(diverse);
     }
+
+    // ── Phantom-leg pruning: remove itineraries with 0-stop transit legs ──
+    // These often arise from stop-matching artifacts where a rider would
+    // board and immediately alight at the same station.
+    // NOTE: Only filter legs that are both 0-stop AND < 60s duration AND
+    // have the same board/alight stop (true phantoms).
+    itineraries.erase(
+        std::remove_if(itineraries.begin(), itineraries.end(), [](const Itinerary& it) {
+            for (const auto& leg : it.legs) {
+                if (leg.mode != "walk"
+                    && leg.stop_count <= 0
+                    && leg.duration_s <= 60
+                    && leg.board_stop_id == leg.alight_stop_id) {
+                    return true;  // itinerary has a phantom transit leg
+                }
+            }
+            return false;
+        }),
+        itineraries.end()
+    );
+
+    // ── Dominance pruning: drop alternatives Pareto-dominated by the best ──
+    // An alternative is dominated if it arrives no earlier AND has strictly
+    // more transfers than the best itinerary.  This prevents the diversity
+    // filter from keeping "unique" patterns that are objectively worse in
+    // every dimension.
+    if (itineraries.size() > 1) {
+        const auto& best = itineraries.front();  // already sorted by score
+        const long long best_arrive = best.arrive_at_ts;
+        const int best_transfers = best.transfer_count;
+        const double best_walk = best.walk_meters;
+
+        itineraries.erase(
+            std::remove_if(itineraries.begin() + 1, itineraries.end(),
+                [best_arrive, best_transfers, best_walk](const Itinerary& alt) {
+                    // Dominated: arrives same-or-later with strictly more transfers
+                    if (alt.arrive_at_ts >= best_arrive && alt.transfer_count > best_transfers) {
+                        // Allow if it's significantly less walking (>200m less)
+                        if (alt.walk_meters + 200.0 < best_walk) return false;
+                        return true;
+                    }
+                    // Also prune if arrives >15 min later with more transfers
+                    if (alt.arrive_at_ts > best_arrive + 900
+                        && alt.transfer_count > best_transfers) {
+                        return true;
+                    }
+                    return false;
+                }),
+            itineraries.end()
+        );
+    }
+
     if (itineraries.size() > static_cast<std::size_t>(request.num_itineraries)) {
         itineraries.resize(static_cast<std::size_t>(request.num_itineraries));
     }
