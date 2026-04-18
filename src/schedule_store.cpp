@@ -535,12 +535,12 @@ ScheduleStore::nearby_stops(double lat, double lon, int radius_m, std::size_t li
     std::sort(results.begin(), results.end(),
               [](const auto& a, const auto& b) { return a.second < b.second; });
 
-    // Deduplicate by parent station (keep ≤2 per station)
+    // Deduplicate by parent station (keep ≤4 per station)
     std::unordered_map<std::string, int> station_count;
     std::vector<std::pair<uint32_t, double>> deduped;
     for (const auto& [idx, dist] : results) {
         auto& cnt = station_count[parent_stop_id(stops_[idx].stop_id)];
-        if (cnt < 2) {
+        if (cnt < 4) {
             deduped.emplace_back(idx, dist);
             ++cnt;
         }

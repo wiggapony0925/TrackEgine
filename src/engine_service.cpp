@@ -2500,6 +2500,13 @@ std::vector<Itinerary> EngineService::compute_itineraries(const PlanRequest& req
             {"dest_stops", destination_candidates.size()},
             {"origin", request.origin.label},
             {"destination", request.destination.label},
+            {"origin_lat", request.origin.lat.value_or(0.0)},
+            {"origin_lon", request.origin.lon.value_or(0.0)},
+            {"dest_lat", request.destination.lat.value_or(0.0)},
+            {"dest_lon", request.destination.lon.value_or(0.0)},
+            {"max_origin_walk_m", request.max_origin_walk_m},
+            {"max_dest_walk_m", request.max_destination_walk_m},
+            {"active_services", active_services.size()},
         });
         return {};
     }

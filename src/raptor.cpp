@@ -215,11 +215,11 @@ std::vector<Itinerary> RaptorRouter::route(
         max_rounds + 1, std::vector<long long>(num_stops, INF));
     std::vector<long long> tau_star(num_stops, INF);
 
-    // populate tau_star with CSA bounds if available
-    if (csa_bounds.size() == num_stops) {
-        for (uint32_t i = 0; i < num_stops; ++i)
-            tau_star[i] = csa_bounds[i];
-    }
+    // CSA bounds give the earliest-possible arrival at each stop.
+    // Use them for reachability pruning only (skip stops CSA proved
+    // unreachable), but do NOT seed tau_star — otherwise RAPTOR can
+    // never improve on the CSA optimum and returns 0 results.
+    const bool have_csa = (csa_bounds.size() == num_stops);
 
     // ── Journey pointers for path reconstruction ─────────────────
     std::vector<std::vector<TransitJourney>> transit_jp(
@@ -239,6 +239,17 @@ std::vector<Itinerary> RaptorRouter::route(
 
     // Global upper-bound on useful arrival (from best known destination arrival)
     long long global_best = INF;
+
+    // Seed global_best from CSA bounds at destination stops — this lets
+    // RAPTOR skip routes that are provably worse than the best direct route.
+    if (have_csa) {
+        for (const auto& [didx, dcand] : dest_map) {
+            if (didx < csa_bounds.size() && csa_bounds[didx] < INF) {
+                long long fa = csa_bounds[didx] + dcand->walk_seconds;
+                global_best = std::min(global_best, fa);
+            }
+        }
+    }
 
     // ── Round 0: seed origin stops ───────────────────────────────
     std::vector<bool> marked(num_stops, false);
@@ -387,7 +398,7 @@ std::vector<Itinerary> RaptorRouter::route(
         for (uint32_t src : transit_improved) {
             const auto& s = store_.stop(src);
             auto neighbors = store_.nearby_stops(
-                s.lat, s.lon, request.max_transfer_walk_m, 8);
+                s.lat, s.lon, request.max_transfer_walk_m, 12);
             for (const auto& [nbr, dist] : neighbors) {
                 if (nbr == src) continue;
                 const int ws = walk_seconds(dist);
@@ -410,19 +421,19 @@ std::vector<Itinerary> RaptorRouter::route(
             }
         }
 
-        // Also allow same-stop "transfer" (platform change, min wait)
+        // Enforce minimum transfer time for same-stop re-boarding.
+        // After alighting from a transit leg, the rider needs at least
+        // kMinTransferS before boarding another trip at the same stop.
+        // We encode this by bumping tau[k][src] so the next round's
+        // boarding check (tau[k][sid]) reflects the earliest possible
+        // departure time after transfer.
         for (uint32_t src : transit_improved) {
             const long long arr = tau[k][src] + kMinTransferS;
-            // This just ensures min transfer time is baked in for
-            // the next round's boarding check, encoded in tau[k].
-            // We DON'T overwrite tau[k][src] with a worse value —
-            // instead, the next round uses tau[k] which already has
-            // the transit arrival time.  The min-transfer buffer is
-            // enforced during boarding: the trip departure must be
-            // >= tau[k][src] (which equals transit arrival).
-            // To truly enforce kMinTransferS, we adjust during
-            // the boarding check in the next round.
-            (void)arr;
+            if (arr > tau[k][src]) {
+                tau[k][src] = arr;
+                // Don't update tau_star — the transit arrival is the
+                // true best arrival; the bump is only for boarding.
+            }
         }
     }
 
